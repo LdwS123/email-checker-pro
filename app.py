@@ -151,11 +151,12 @@ def check_github_profile(email):
     """Find GitHub profile associated with this email."""
     if not GH_TOKEN:
         return None
+    headers = {"Authorization": f"token {GH_TOKEN}"}
     try:
+        # Method 1: search users by public email
         r = http_requests.get(
             f"https://api.github.com/search/users?q={email}+in:email",
-            headers={"Authorization": f"token {GH_TOKEN}"},
-            timeout=10,
+            headers=headers, timeout=10,
         )
         if r.status_code == 200:
             items = r.json().get("items", [])
@@ -163,6 +164,20 @@ def check_github_profile(email):
                 u = items[0]
                 return {"login": u["login"], "url": u["html_url"],
                         "avatar": u.get("avatar_url", ""), "name": u.get("name", "")}
+
+        # Method 2: find profile via commits (works even with private email)
+        r2 = http_requests.get(
+            f"https://api.github.com/search/commits?q=author-email:{email}",
+            headers={**headers, "Accept": "application/vnd.github.cloak-preview+json"},
+            timeout=10,
+        )
+        if r2.status_code == 200:
+            items2 = r2.json().get("items", [])
+            if items2:
+                author = items2[0].get("author")
+                if author:
+                    return {"login": author["login"], "url": author["html_url"],
+                            "avatar": author.get("avatar_url", ""), "name": author.get("login", "")}
         return None
     except Exception:
         return None

@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.env
+verified_emails.csv
+mega_done.txt
+*.log
+venv/
+.DS_Store

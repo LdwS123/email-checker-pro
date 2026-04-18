@@ -72,6 +72,49 @@ def check_catchall(domain):
         return None
 
 
+# ── API-based verification (fallback when port 25 blocked) ──
+api_cache = {}
+
+def check_email_api(email):
+    """Use free APIs to verify email when SMTP is blocked."""
+    if email in api_cache:
+        return api_cache[email]
+
+    result = {"deliverable": None, "disposable": False, "role": False, "provider": None, "domain_age": None}
+
+    # Try mailcheck.ai first (gives provider info + domain age)
+    try:
+        r = http_requests.get(f"https://api.mailcheck.ai/email/{email}", timeout=8)
+        if r.status_code == 200:
+            data = r.json()
+            result["disposable"] = data.get("disposable", False)
+            result["role"] = data.get("role_account", False)
+            result["domain_age"] = data.get("domain_age_in_days")
+            providers = data.get("mx_providers", [])
+            if providers:
+                result["provider"] = providers[0].get("slug", "")
+            result["deliverable"] = not data.get("disposable", False) and data.get("mx", False)
+    except Exception:
+        pass
+
+    # Try disify.com as second source
+    try:
+        r = http_requests.get(f"https://disify.com/api/email/{email}", timeout=8)
+        if r.status_code == 200:
+            data = r.json()
+            if result["deliverable"] is None:
+                result["deliverable"] = data.get("format", False) and data.get("dns", False)
+            if data.get("disposable", False):
+                result["disposable"] = True
+            if data.get("role", False):
+                result["role"] = True
+    except Exception:
+        pass
+
+    api_cache[email] = result
+    return result
+
+
 def check_gravatar(email):
     """Check if email has a Gravatar profile."""
     try:
@@ -135,12 +178,14 @@ def compute_score(result):
     if result["dns"]:
         score += 15
 
-    # SMTP valid: +40 (biggest signal)
+    # SMTP valid: +40 (biggest signal), API valid: +30
     if result["smtp"] is True:
         if result["catchall"]:
             score += 20  # Less certain for catch-all
+        elif result.get("reason") == "Verifie via API":
+            score += 30  # API confirmation (less certain than SMTP)
         else:
-            score += 40  # Confirmed by server
+            score += 40  # Confirmed by SMTP server
 
     # Gravatar: +10
     if result.get("gravatar"):
@@ -204,15 +249,19 @@ def verify_single(email):
     result["catchall"] = catchall
     if catchall:
         result["checks"].append({"name": "Catch-all", "pass": None, "detail": "Domaine accepte tout"})
-    else:
+    elif catchall is False:
         result["checks"].append({"name": "Catch-all", "pass": True, "detail": "Domaine filtre les emails"})
+    else:
+        result["checks"].append({"name": "Catch-all", "pass": None, "detail": "Non testable (port bloque)"})
 
-    # 4. SMTP
+    # 4. SMTP (direct) — try first, fallback to API if port 25 blocked
+    smtp_ok = False
     try:
         with smtplib.SMTP(mx, 25, timeout=8) as smtp:
             smtp.ehlo("check.example.com")
             smtp.mail("test@example.com")
             code, msg = smtp.rcpt(email)
+            smtp_ok = True
             if code == 250:
                 result["smtp"] = True
                 if catchall:
@@ -229,13 +278,40 @@ def verify_single(email):
                 result["reason"] = f"Rejete (code {code})"
                 result["checks"].append({"name": "SMTP", "pass": False, "detail": f"Rejete ({code})"})
     except smtplib.SMTPServerDisconnected:
-        result["status"] = "unknown"
-        result["reason"] = "Connexion coupee"
         result["checks"].append({"name": "SMTP", "pass": None, "detail": "Connexion coupee"})
-    except Exception as e:
-        result["status"] = "unknown"
-        result["reason"] = f"Erreur: {str(e)[:50]}"
-        result["checks"].append({"name": "SMTP", "pass": None, "detail": str(e)[:50]})
+    except Exception:
+        pass  # Port 25 blocked — will use API fallback
+
+    # 4b. API fallback if SMTP failed
+    if not smtp_ok:
+        api = check_email_api(email)
+        detail_parts = []
+        if api.get("provider"):
+            detail_parts.append(f"Provider: {api['provider']}")
+        if api.get("domain_age") is not None:
+            age_years = round(api["domain_age"] / 365, 1)
+            detail_parts.append(f"Domaine: {age_years}ans")
+        if api.get("disposable"):
+            detail_parts.append("JETABLE")
+        if api.get("role"):
+            detail_parts.append("role-email")
+
+        if api.get("deliverable") is True and not api.get("disposable"):
+            result["smtp"] = True
+            result["status"] = "valid"
+            result["reason"] = "Verifie via API"
+            detail = "Deliverable (API) — " + ", ".join(detail_parts) if detail_parts else "Deliverable (API)"
+            result["checks"].append({"name": "SMTP/API", "pass": True, "detail": detail})
+        elif api.get("disposable"):
+            result["smtp"] = False
+            result["status"] = "invalid"
+            result["reason"] = "Email jetable"
+            result["checks"].append({"name": "SMTP/API", "pass": False, "detail": "Email jetable (disposable)"})
+        else:
+            result["status"] = "unknown"
+            result["reason"] = "Non verifiable"
+            detail = "Port 25 bloque — " + ", ".join(detail_parts) if detail_parts else "Port 25 bloque"
+            result["checks"].append({"name": "SMTP/API", "pass": None, "detail": detail})
 
     # 5-7. Gravatar + GitHub + Blacklist — run in parallel
     with ThreadPoolExecutor(max_workers=3) as pool:

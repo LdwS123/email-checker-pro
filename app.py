@@ -146,6 +146,42 @@ def check_github_commits(email):
         return None
 
 
+def check_github_profile(email):
+    """Find GitHub profile associated with this email."""
+    if not GH_TOKEN:
+        return None
+    try:
+        r = http_requests.get(
+            f"https://api.github.com/search/users?q={email}+in:email",
+            headers={"Authorization": f"token {GH_TOKEN}"},
+            timeout=10,
+        )
+        if r.status_code == 200:
+            items = r.json().get("items", [])
+            if items:
+                u = items[0]
+                return {"login": u["login"], "url": u["html_url"],
+                        "avatar": u.get("avatar_url", ""), "name": u.get("name", "")}
+        return None
+    except Exception:
+        return None
+
+
+def build_linkedin_url(email):
+    """Generate a LinkedIn search URL from the email."""
+    local = email.split("@")[0]
+    domain = email.split("@")[1]
+    company = domain.split(".")[0]
+    # Extract name parts from local (e.g. john.doe -> John Doe)
+    parts = re.split(r"[._\-]", local)
+    # Filter out numbers and very short parts
+    name_parts = [p.capitalize() for p in parts if len(p) > 1 and not p.isdigit()]
+    if not name_parts:
+        return None
+    query = "+".join(name_parts + [company])
+    return f"https://www.linkedin.com/search/results/people/?keywords={query}"
+
+
 def check_blacklists(domain):
     """Check domain against DNSBL blacklists."""
     if domain in blacklist_cache:
@@ -195,6 +231,10 @@ def compute_score(result):
     gh = result.get("github_commits")
     if gh is not None and gh > 0:
         score += 15
+
+    # GitHub profile found: +10
+    if result.get("github_profile"):
+        score += 10
 
     # Blacklist clean: +10
     bl = result.get("blacklist", {})
@@ -313,16 +353,19 @@ def verify_single(email):
             detail = "Port 25 bloque — " + ", ".join(detail_parts) if detail_parts else "Port 25 bloque"
             result["checks"].append({"name": "SMTP/API", "pass": None, "detail": detail})
 
-    # 5-7. Gravatar + GitHub + Blacklist — run in parallel
-    with ThreadPoolExecutor(max_workers=3) as pool:
+    # 5-9. Gravatar + GitHub commits + GitHub profile + Blacklist — run in parallel
+    with ThreadPoolExecutor(max_workers=5) as pool:
         fut_grav = pool.submit(check_gravatar, email)
         fut_gh = pool.submit(check_github_commits, email)
+        fut_ghp = pool.submit(check_github_profile, email)
         fut_bl = pool.submit(check_blacklists, domain)
 
         grav = fut_grav.result()
         gh = fut_gh.result()
+        ghp = fut_ghp.result()
         bl = fut_bl.result()
 
+    # 5. Gravatar
     result["gravatar"] = grav
     result["checks"].append({
         "name": "Gravatar",
@@ -330,16 +373,44 @@ def verify_single(email):
         "detail": "Profil trouve" if grav else "Pas de profil",
     })
 
+    # 6. GitHub commits
     result["github_commits"] = gh
     if gh is not None:
         result["checks"].append({
-            "name": "GitHub",
+            "name": "GitHub Commits",
             "pass": gh > 0,
             "detail": f"{gh} commits" if gh > 0 else "Aucun commit",
         })
     else:
-        result["checks"].append({"name": "GitHub", "pass": None, "detail": "Non verifie (pas de token)"})
+        result["checks"].append({"name": "GitHub Commits", "pass": None, "detail": "Non verifie (pas de token)"})
 
+    # 7. GitHub profile
+    if ghp:
+        result["github_profile"] = ghp
+        result["checks"].append({
+            "name": "GitHub Profil",
+            "pass": True,
+            "detail": f"@{ghp['login']}",
+            "url": ghp["url"],
+        })
+    else:
+        result["checks"].append({"name": "GitHub Profil", "pass": False, "detail": "Pas de profil public"})
+
+    # 8. LinkedIn search
+    li_url = build_linkedin_url(email)
+    if li_url:
+        result["linkedin_url"] = li_url
+        local = email.split("@")[0]
+        name_parts = re.split(r"[._\-]", local)
+        name_display = " ".join(p.capitalize() for p in name_parts if len(p) > 1 and not p.isdigit())
+        result["checks"].append({
+            "name": "LinkedIn",
+            "pass": None,
+            "detail": f"Rechercher {name_display}",
+            "url": li_url,
+        })
+
+    # 9. Blacklist
     result["blacklist"] = bl
     if bl["clean"]:
         result["checks"].append({"name": "Blacklist", "pass": True, "detail": f"Clean ({bl['checked']}/{bl['checked']})"})
@@ -559,9 +630,10 @@ HTML_TEMPLATE = r"""
   .score-circle.low { background: #ffeaeb; color: #d1242f; }
 
   .checks-grid {
-    display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
+    display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px;
   }
-  @media (max-width: 600px) { .checks-grid { grid-template-columns: 1fr; } }
+  @media (max-width: 800px) { .checks-grid { grid-template-columns: 1fr 1fr; } }
+  @media (max-width: 500px) { .checks-grid { grid-template-columns: 1fr; } }
 
   .check-item {
     display: flex; align-items: center; gap: 10px; padding: 10px 14px;
@@ -765,7 +837,17 @@ function renderCard(r) {
 
       var detail = document.createElement('div');
       detail.className = 'check-detail';
-      detail.textContent = ck.detail || '';
+      if (ck.url) {
+        var link = document.createElement('a');
+        link.href = ck.url;
+        link.target = '_blank';
+        link.rel = 'noopener';
+        link.textContent = ck.detail || '';
+        link.style.cssText = 'color: #0071e3; text-decoration: none; font-weight: 500;';
+        detail.appendChild(link);
+      } else {
+        detail.textContent = ck.detail || '';
+      }
 
       info.appendChild(name);
       info.appendChild(detail);

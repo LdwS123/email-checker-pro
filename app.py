@@ -27,6 +27,7 @@ EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 mx_cache = {}
 catchall_cache = {}
 blacklist_cache = {}
+smtp_blocked = False  # Auto-detect: set True if port 25 is unreachable
 
 BLACKLISTS = [
     "zen.spamhaus.org",
@@ -284,45 +285,56 @@ def verify_single(email):
     result["mx"] = mx
     result["checks"].append({"name": "DNS/MX", "pass": True, "detail": mx})
 
-    # 3. Catch-all
-    catchall = check_catchall(domain)
-    result["catchall"] = catchall
-    if catchall:
-        result["checks"].append({"name": "Catch-all", "pass": None, "detail": "Domaine accepte tout"})
-    elif catchall is False:
-        result["checks"].append({"name": "Catch-all", "pass": True, "detail": "Domaine filtre les emails"})
-    else:
-        result["checks"].append({"name": "Catch-all", "pass": None, "detail": "Non testable (port bloque)"})
-
-    # 4. SMTP (direct) — try first, fallback to API if port 25 blocked
+    # 3. Catch-all + 4. SMTP — skip if port 25 is known to be blocked
+    global smtp_blocked
     smtp_ok = False
-    try:
-        with smtplib.SMTP(mx, 25, timeout=8) as smtp:
-            smtp.ehlo("check.example.com")
-            smtp.mail("test@example.com")
-            code, msg = smtp.rcpt(email)
-            smtp_ok = True
-            if code == 250:
-                result["smtp"] = True
-                if catchall:
-                    result["status"] = "catch-all"
-                    result["reason"] = "Catch-all: accepte tout"
-                    result["checks"].append({"name": "SMTP", "pass": None, "detail": "Accepte (catch-all)"})
-                else:
-                    result["status"] = "valid"
-                    result["reason"] = "Boite mail confirmee"
-                    result["checks"].append({"name": "SMTP", "pass": True, "detail": "Boite mail existe (250)"})
-            else:
-                result["smtp"] = False
-                result["status"] = "invalid"
-                result["reason"] = f"Rejete (code {code})"
-                result["checks"].append({"name": "SMTP", "pass": False, "detail": f"Rejete ({code})"})
-    except smtplib.SMTPServerDisconnected:
-        result["checks"].append({"name": "SMTP", "pass": None, "detail": "Connexion coupee"})
-    except Exception:
-        pass  # Port 25 blocked — will use API fallback
 
-    # 4b. API fallback if SMTP failed
+    if not smtp_blocked:
+        # 3. Catch-all
+        catchall = check_catchall(domain)
+        result["catchall"] = catchall
+        if catchall:
+            result["checks"].append({"name": "Catch-all", "pass": None, "detail": "Domaine accepte tout"})
+        elif catchall is False:
+            result["checks"].append({"name": "Catch-all", "pass": True, "detail": "Domaine filtre les emails"})
+        else:
+            result["checks"].append({"name": "Catch-all", "pass": None, "detail": "Non testable"})
+
+        # 4. SMTP direct
+        try:
+            with smtplib.SMTP(mx, 25, timeout=8) as smtp:
+                smtp.ehlo("check.example.com")
+                smtp.mail("test@example.com")
+                code, msg = smtp.rcpt(email)
+                smtp_ok = True
+                if code == 250:
+                    result["smtp"] = True
+                    if catchall:
+                        result["status"] = "catch-all"
+                        result["reason"] = "Catch-all: accepte tout"
+                        result["checks"].append({"name": "SMTP", "pass": None, "detail": "Accepte (catch-all)"})
+                    else:
+                        result["status"] = "valid"
+                        result["reason"] = "Boite mail confirmee"
+                        result["checks"].append({"name": "SMTP", "pass": True, "detail": "Boite mail existe (250)"})
+                else:
+                    result["smtp"] = False
+                    result["status"] = "invalid"
+                    result["reason"] = f"Rejete (code {code})"
+                    result["checks"].append({"name": "SMTP", "pass": False, "detail": f"Rejete ({code})"})
+        except smtplib.SMTPServerDisconnected:
+            result["checks"].append({"name": "SMTP", "pass": None, "detail": "Connexion coupee"})
+        except OSError as e:
+            if "unreachable" in str(e).lower() or "Network is unreachable" in str(e):
+                smtp_blocked = True  # Auto-detect: port 25 blocked on this host
+            # Will use API fallback below
+        except Exception:
+            pass
+    else:
+        # Port 25 blocked — skip SMTP entirely
+        result["checks"].append({"name": "Catch-all", "pass": None, "detail": "SMTP non dispo (cloud)"})
+
+    # 4b. API fallback if SMTP failed/blocked
     if not smtp_ok:
         api = check_email_api(email)
         detail_parts = []
@@ -423,7 +435,7 @@ def verify_single(email):
     return result
 
 
-def verify_with_timeout(email, timeout=30):
+def verify_with_timeout(email, timeout=45):
     """Run verify_single with a hard timeout."""
     with ThreadPoolExecutor(max_workers=1) as ex:
         fut = ex.submit(verify_single, email)
@@ -445,7 +457,7 @@ def verify_with_timeout(email, timeout=30):
 def process_job(job_id, emails):
     """Process emails in parallel — up to 5 at a time, 30s max per email."""
     def _do(email):
-        result = verify_with_timeout(email, timeout=30)
+        result = verify_with_timeout(email, timeout=45)
         with job_lock:
             jobs[job_id]["results"].append(result)
 

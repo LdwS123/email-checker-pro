@@ -18,6 +18,7 @@ personal_emails_free.csv
 smtp_verified_emails.csv
 domains_done.txt
 founders_done.txt
+emails.db
 *.log
 venv/
 .DS_Store

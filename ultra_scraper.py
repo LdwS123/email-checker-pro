@@ -85,7 +85,46 @@ GENERIC_LOCALS = {
     "zen", "agent", "tech", "developer", "noreply", "no-reply",
     "enterprise", "marketplace", "growth", "project-feedback", "teste",
     "hellow", "email-matt", "pr", "ap", "rcs",
+    # Ajouts : VC/investor-specific genericals
+    "inquiries", "inquiry", "pitch", "pitches", "deck", "decks", "apply",
+    "investor", "investors", "investment", "investments", "ir", "lp",
+    "partner", "partnerships", "bd", "biz", "business", "exec", "executive",
+    "research", "insights", "content", "editorial", "crypto", "opensource",
+    "opensourceprogram", "oss", "community-team", "dev-rel",
+    "karma", "accessibility", "a11y", "diversity", "dei", "people",
+    "talent", "recruiting", "recruit", "recruitment", "culture",
+    "events", "event", "conference", "summit", "webinar",
+    "comms", "communication", "communications", "pr-team", "public-relations",
+    "outreach", "grant", "grants", "submissions", "submission",
+    "portfolio", "program", "programs", "accelerator", "incubator",
+    "student", "students", "intern", "interns", "internship",
+    "feedback-team", "audit", "compliance", "risk", "kyc", "aml",
+    "verify", "verification", "security-team", "infosec", "bugbounty",
+    "mailto", "share", "social", "instagram", "twitter", "linkedin",
+    "tiktok", "youtube", "facebook", "discord", "slack", "telegram",
+    "chat", "talk", "customer", "customers", "clients", "client",
+    "public", "investorrelations", "shareholder", "shareholders",
+    "education", "learn", "learning", "academy", "training", "trainings",
+    "advisor", "advisors", "advisory", "board", "directors",
+    "donations", "donation", "donate", "giving", "charity",
+    "podcast", "podcasts", "video", "videos", "photo", "photos",
+    "playbook", "playbooks", "brief", "briefs", "report", "reports",
 }
+
+# Pattern des locaux structurellement génériques (marketing / campagne / brand)
+GENERIC_LOCAL_PATTERNS = re.compile(
+    r"^("
+    r"[a-z0-9]+-(ai|ml|eng|engineering|design|product|marketing|content|"
+    r"comms|comm|press|pr|media|research|growth|sales|bd|biz|investor|lp|ir|"
+    r"playbook|brief|report|newsletter|events?|summit|conference|podcast|"
+    r"portfolio|apply|pitch|pitches?|submissions?|grants?|education|training|"
+    r"recruiting|talent|hr|careers|jobs|diversity|dei|community|social|"
+    r"program|accelerator|incubator|outreach|insights|editorial)s?"
+    r"|"
+    r"(ai|ml|crypto|web3|growth|gtm|marketing|media|pr|press|ops)-[a-z0-9]+"
+    r")$",
+    re.I,
+)
 
 EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 
@@ -100,7 +139,12 @@ def is_personal(email, domain):
         return False
     if local in GENERIC_LOCALS:
         return False
+    if GENERIC_LOCAL_PATTERNS.match(local):
+        return False
     if local.isdigit() or len(local) < 2 or len(local) > 40:
+        return False
+    # Heuristique : locaux avec 3+ tirets = brand/campagne (ex: a16z-ai-playbook)
+    if local.count("-") >= 2 or local.count(".") >= 3:
         return False
     if re.search(
         r"noreply|github|localdomain|bot|robot|auto|deploy|release|"
@@ -620,6 +664,60 @@ def run_full_check(email):
     }
 
 
+# ══════════════════════════════════════════════════════════════
+# DÉTECTION DE POSTE (GitHub bio + heuristiques)
+# ══════════════════════════════════════════════════════════════
+ROLE_KEYWORDS = {
+    "CEO": ["ceo", "chief executive"],
+    "CTO": ["cto", "chief technology", "chief technical"],
+    "COO": ["coo", "chief operating"],
+    "CFO": ["cfo", "chief financial"],
+    "CPO": ["cpo", "chief product"],
+    "VP Engineering": ["vp eng", "vice president eng", "vp of eng"],
+    "Co-Founder": ["co-founder", "cofounder", "co founder"],
+    "Founder": ["founder", "fondateur", "founding"],
+    "Head of Engineering": ["head of eng", "engineering lead", "eng lead"],
+    "Head of Product": ["head of product", "product lead"],
+    "Staff Engineer": ["staff eng", "staff software"],
+    "Senior Engineer": ["senior eng", "senior software", "senior dev", "sr eng", "sr dev"],
+    "Engineer": ["engineer", "developer", "dev ", "développeur", "swe "],
+    "Designer": ["designer", "design lead", "head of design", "ux ", "ui "],
+    "Data Scientist": ["data scien", "ml eng", "machine learning"],
+    "Product Manager": ["product manager", "pm ", "product owner"],
+    "DevRel": ["devrel", "developer relations", "developer advocate", "dev advocate"],
+}
+
+
+def detect_role_from_bio(bio):
+    """Détecte le poste depuis une bio GitHub."""
+    if not bio:
+        return None
+    bio_lower = bio.lower()
+    # Check most specific roles first
+    for role, keywords in ROLE_KEYWORDS.items():
+        for kw in keywords:
+            if kw in bio_lower:
+                return role
+    return None
+
+
+def get_github_role(username):
+    """Récupère le bio GitHub et détecte le poste."""
+    if not GH_TOKEN or not username:
+        return None
+    try:
+        data = gh_get(f"https://api.github.com/users/{username}")
+        if data:
+            bio = data.get("bio", "") or ""
+            company = data.get("company", "") or ""
+            full_text = f"{bio} {company}"
+            role = detect_role_from_bio(full_text)
+            return role
+    except Exception:
+        pass
+    return None
+
+
 def source_yc_patterns(domain):
     """Trouve les fondateurs YC puis bruteforce les patterns d'email."""
     emails = set()
@@ -952,6 +1050,20 @@ def harvest_domain(domain, verbose=False):
         # GitHub profile from checker
         ghp = check.get("github_profile")
         github_url = ghp["url"] if ghp else ""
+        gh_login = ghp["login"] if ghp else ""
+
+        # Detect role — GitHub bio + YC founders crossref
+        poste = ""
+        if gh_login:
+            poste = get_github_role(gh_login) or ""
+        # If name matches a YC founder → mark as Founder
+        if not poste and founders_found:
+            for fn in founders_found:
+                if name and (fn.lower() in name.lower() or name.lower() in fn.lower()):
+                    poste = "Founder"
+                    break
+        if not poste:
+            poste = "Team"
 
         # LinkedIn search URL
         local = email.split("@")[0]
@@ -968,6 +1080,7 @@ def harvest_domain(domain, verbose=False):
             "domain": domain,
             "email": email,
             "name": name,
+            "poste": poste,
             "sources": "+".join(sorted(set(info["sources"]))),
             "status": status,
             "score": score,
@@ -988,7 +1101,7 @@ def harvest_domain(domain, verbose=False):
         if results:
             print(f"    ✅ {len(results)} emails ({src_str}){found_str}")
             for r in results:
-                print(f"       {r['email']:35s} [{r['status']:8s}] {r['name']}")
+                print(f"       {r['email']:35s} [{r['status']:8s}] {r['name']} ({r['poste']})")
         else:
             print(f"    ❌ Aucun email ({src_str})")
 
@@ -1072,7 +1185,7 @@ def main():
     if args.reset and os.path.exists(DONE_FILE):
         os.remove(DONE_FILE)
 
-    FIELDNAMES = ["company", "domain", "email", "name", "sources", "status", "score", "github", "linkedin", "founders"]
+    FIELDNAMES = ["company", "domain", "email", "name", "poste", "sources", "status", "score", "github", "linkedin", "founders"]
 
     # ── Single domain ──
     if args.domain:

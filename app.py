@@ -13,6 +13,15 @@ from flask import Flask, render_template_string, request, jsonify, Response
 import dns.resolver
 import requests as http_requests
 
+# Scraper OSINT : harvest_domain() est exposée par ultra_scraper.py
+# Import paresseux pour ne pas payer le coût si le service ne sert que Email Checker
+try:
+    from ultra_scraper import harvest_domain
+    SCRAPER_AVAILABLE = True
+except Exception as _scraper_err:
+    SCRAPER_AVAILABLE = False
+    _SCRAPER_IMPORT_ERROR = str(_scraper_err)
+
 app = Flask(__name__)
 
 GH_TOKEN = os.environ.get("GH_TOKEN", "")
@@ -546,6 +555,127 @@ def export_csv(job_id):
                     headers={"Content-Disposition": "attachment; filename=verified_emails.csv"})
 
 
+# ═══════════════════════════════════════════════════════════════════
+#   SCRAPER MODULE — greffe sur ultra_scraper.harvest_domain()
+#   Mêmes conventions que /api/check : jobs en mémoire, polling, export CSV
+# ═══════════════════════════════════════════════════════════════════
+
+DOMAIN_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?([a-zA-Z0-9][a-zA-Z0-9\-]{0,62}(?:\.[a-zA-Z0-9][a-zA-Z0-9\-]{0,62})+)",
+    re.I,
+)
+
+
+def parse_domains(raw):
+    """Extrait une liste de domaines dédupliquée depuis un texte libre."""
+    matches = DOMAIN_RE.findall(raw or "")
+    seen = []
+    for m in matches:
+        d = m.lower().strip("/")
+        if d and d not in seen:
+            seen.append(d)
+    return seen
+
+
+def process_scrape_job(job_id, domains):
+    """Lance harvest_domain sur chaque domaine, accumule les résultats.
+
+    Concurrence : séquentielle (1 domaine à la fois). harvest_domain()
+    utilise déjà 9 workers internes pour ses 10 sources OSINT — lancer
+    plusieurs domaines en parallèle risque d'OOM sur Render free (512MB).
+    """
+    for domain in domains:
+        with job_lock:
+            jobs[job_id]["current"] = domain
+
+        try:
+            results, sources, founders = harvest_domain(domain, verbose=False)
+        except Exception as e:
+            with job_lock:
+                jobs[job_id]["errors"].append({"domain": domain, "error": str(e)})
+                jobs[job_id]["checked_domains"] += 1
+            continue
+
+        with job_lock:
+            for r in results:
+                jobs[job_id]["results"].append(r)
+            jobs[job_id]["checked_domains"] += 1
+            jobs[job_id]["sources_summary"][domain] = sources
+
+    with job_lock:
+        jobs[job_id]["done"] = True
+        jobs[job_id]["current"] = None
+
+
+@app.route("/api/scrape", methods=["POST"])
+def scrape_domains():
+    global job_counter
+    if not SCRAPER_AVAILABLE:
+        return jsonify({"error": f"Scraper non disponible : {_SCRAPER_IMPORT_ERROR}"}), 503
+
+    data = request.json or {}
+    raw = data.get("domains", "")
+    domains = parse_domains(raw)
+    if not domains:
+        return jsonify({"error": "Aucun domaine valide trouvé"}), 400
+    if len(domains) > 20:
+        return jsonify({"error": "Max 20 domaines par batch (limite Render free-tier)"}), 400
+
+    with job_lock:
+        job_counter += 1
+        job_id = str(job_counter)
+        jobs[job_id] = {
+            "type": "scrape",
+            "domains": domains,
+            "results": [],
+            "errors": [],
+            "sources_summary": {},
+            "checked_domains": 0,
+            "current": None,
+            "done": False,
+        }
+
+    thread = Thread(target=process_scrape_job, args=(job_id, domains), daemon=True)
+    thread.start()
+    return jsonify({"job_id": job_id, "total": len(domains)})
+
+
+@app.route("/api/scrape/status/<job_id>")
+def scrape_status(job_id):
+    with job_lock:
+        job = jobs.get(job_id)
+        if not job or job.get("type") != "scrape":
+            return jsonify({"error": "Job not found"}), 404
+        return jsonify({
+            "total": len(job["domains"]),
+            "checked": job["checked_domains"],
+            "current": job["current"],
+            "done": job["done"],
+            "results": job["results"],
+            "errors": job["errors"],
+        })
+
+
+@app.route("/api/scrape/export/<job_id>")
+def scrape_export(job_id):
+    with job_lock:
+        job = jobs.get(job_id)
+        if not job or job.get("type") != "scrape":
+            return "Job not found", 404
+        header = ["company", "domain", "email", "name", "poste", "sources",
+                  "status", "score", "github", "linkedin", "founders"]
+        lines = [",".join(header)]
+        for r in job["results"]:
+            row = []
+            for col in header:
+                val = str(r.get(col, "") or "").replace(",", ";").replace("\n", " ")
+                row.append(val)
+            lines.append(",".join(row))
+    csv_data = "\n".join(lines)
+    return Response(csv_data, mimetype="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=scraped_emails.csv"})
+
+
 HTML_TEMPLATE = r"""
 <!DOCTYPE html>
 <html lang="fr">
@@ -563,6 +693,42 @@ HTML_TEMPLATE = r"""
   h1 { font-size: 2.2rem; font-weight: 700; margin-bottom: 6px; color: #1d1d1f; }
   h1 span { color: #0071e3; }
   .subtitle { color: #86868b; margin-bottom: 28px; font-size: 0.95rem; }
+
+  .tabs {
+    display: flex; gap: 4px; margin: 18px 0 26px 0; padding: 4px;
+    background: #e8e8ed; border-radius: 10px; width: fit-content;
+  }
+  .tab {
+    padding: 10px 22px; border-radius: 8px; border: none; background: transparent;
+    color: #1d1d1f; font-size: 14px; font-weight: 600; cursor: pointer;
+    transition: all 0.2s;
+  }
+  .tab.active { background: #fff; color: #0071e3; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+  .tab:hover:not(.active) { background: rgba(255,255,255,0.5); }
+
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; animation: fadeIn 0.25s ease; }
+
+  .scrape-domain-group { border: 1px solid #e5e5ea; border-radius: 14px;
+    background: #fff; padding: 16px 20px; margin-bottom: 12px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+  }
+  .scrape-domain-group .dh { display: flex; justify-content: space-between;
+    align-items: center; font-weight: 600; margin-bottom: 10px; font-size: 15px; }
+  .scrape-domain-group .dh .cnt { color: #34c759; font-size: 13px; }
+  .scrape-domain-group .email-row { padding: 8px 0; border-top: 1px solid #f2f2f7;
+    display: flex; gap: 10px; align-items: center; font-size: 14px; }
+  .scrape-domain-group .email-row .score-mini { width: 30px; height: 30px;
+    border-radius: 50%; background: #34c759; color: #fff; font-size: 12px;
+    font-weight: 700; display: flex; align-items: center; justify-content: center; }
+  .scrape-domain-group .email-row .score-mini.mid { background: #ff9500; }
+  .scrape-domain-group .email-row .score-mini.low { background: #8e8e93; }
+  .scrape-domain-group .email-row .em { font-family: 'SF Mono', Monaco, monospace; }
+  .scrape-domain-group .email-row .nm { color: #86868b; font-size: 13px; margin-left: 6px; }
+  .scrape-domain-group .email-row .src { margin-left: auto; color: #86868b; font-size: 12px; }
+  .scrape-current { padding: 10px 14px; background: #f0f7ff; border-left: 3px solid #0071e3;
+    border-radius: 6px; color: #0071e3; font-family: 'SF Mono', Monaco, monospace;
+    font-size: 13px; margin-top: 12px; display: none; }
 
   textarea {
     width: 100%; height: 150px; background: #fff; border: 2px solid #d2d2d7;
@@ -694,32 +860,68 @@ HTML_TEMPLATE = r"""
 <body>
 <div class="container">
   <h1>Email <span>Checker Pro</span></h1>
-  <p class="subtitle">7 verifications par email : Format, DNS/MX, Catch-all, SMTP, Gravatar, GitHub, Blacklist</p>
 
-  <textarea id="emailInput" placeholder="Colle tes emails ici, ou importe un CSV...&#10;&#10;john@company.com&#10;jane@startup.io, founder@saas.com&#10;&#10;Tout format accepte : CSV, texte brut, un par ligne..."></textarea>
+  <nav class="tabs" role="tablist">
+    <button class="tab active" data-tab="checker" onclick="switchTab('checker')">Email Checker</button>
+    <button class="tab" data-tab="scraper" onclick="switchTab('scraper')">Scraper</button>
+  </nav>
 
-  <div class="drop-zone" id="dropZone">Glisse un fichier CSV ici</div>
+  <!-- ═══════ TAB : EMAIL CHECKER ═══════ -->
+  <div class="tab-panel active" id="panel-checker">
+    <p class="subtitle">7 verifications par email : Format, DNS/MX, Catch-all, SMTP, Gravatar, GitHub, Blacklist</p>
 
-  <div class="actions">
-    <button class="btn-check" id="btnCheck" onclick="startCheck()">Verifier</button>
-    <input type="file" id="csvFile" accept=".csv,.txt" onchange="handleCSV(this)">
-    <label class="btn btn-csv" for="csvFile">Importer CSV</label>
-    <button class="btn-clear" id="btnClear" onclick="clearAll()">Effacer</button>
-    <button class="btn-export" id="btnExport" onclick="exportCSV()" disabled>Exporter CSV</button>
-    <span class="count-info" id="countInfo"></span>
+    <textarea id="emailInput" placeholder="Colle tes emails ici, ou importe un CSV...&#10;&#10;john@company.com&#10;jane@startup.io, founder@saas.com&#10;&#10;Tout format accepte : CSV, texte brut, un par ligne..."></textarea>
+
+    <div class="drop-zone" id="dropZone">Glisse un fichier CSV ici</div>
+
+    <div class="actions">
+      <button class="btn-check" id="btnCheck" onclick="startCheck()">Verifier</button>
+      <input type="file" id="csvFile" accept=".csv,.txt" onchange="handleCSV(this)">
+      <label class="btn btn-csv" for="csvFile">Importer CSV</label>
+      <button class="btn-clear" id="btnClear" onclick="clearAll()">Effacer</button>
+      <button class="btn-export" id="btnExport" onclick="exportCSV()" disabled>Exporter CSV</button>
+      <span class="count-info" id="countInfo"></span>
+    </div>
+
+    <div class="progress-bar" id="progressBar"><div class="fill" id="progressFill"></div></div>
+    <div class="progress-text" id="progressText"></div>
+
+    <div class="stats" id="stats">
+      <div class="stat valid"><div class="num" id="nValid">0</div><div class="label">Valides</div></div>
+      <div class="stat invalid"><div class="num" id="nInvalid">0</div><div class="label">Invalides</div></div>
+      <div class="stat catchall"><div class="num" id="nCatchall">0</div><div class="label">Catch-all</div></div>
+      <div class="stat unknown"><div class="num" id="nUnknown">0</div><div class="label">Inconnus</div></div>
+    </div>
+
+    <div class="results" id="results"></div>
   </div>
 
-  <div class="progress-bar" id="progressBar"><div class="fill" id="progressFill"></div></div>
-  <div class="progress-text" id="progressText"></div>
+  <!-- ═══════ TAB : SCRAPER ═══════ -->
+  <div class="tab-panel" id="panel-scraper">
+    <p class="subtitle">Trouve les emails d'un domaine : 10 sources OSINT (GitHub, PGP, Wayback, Bing, site...) + 7 checks de vérification. Max 20 domaines par batch.</p>
 
-  <div class="stats" id="stats">
-    <div class="stat valid"><div class="num" id="nValid">0</div><div class="label">Valides</div></div>
-    <div class="stat invalid"><div class="num" id="nInvalid">0</div><div class="label">Invalides</div></div>
-    <div class="stat catchall"><div class="num" id="nCatchall">0</div><div class="label">Catch-all</div></div>
-    <div class="stat unknown"><div class="num" id="nUnknown">0</div><div class="label">Inconnus</div></div>
+    <textarea id="domainInput" placeholder="Colle des domaines ou URLs, un par ligne...&#10;&#10;acme.com&#10;https://www.startup.io&#10;founder.vc&#10;&#10;Le scraper trouve TOUS les emails personnels + les vérifie."></textarea>
+
+    <div class="actions">
+      <button class="btn-check" id="btnScrape" onclick="startScrape()">Scraper</button>
+      <button class="btn-clear" id="btnScrapeClear" onclick="clearScrape()">Effacer</button>
+      <button class="btn-export" id="btnScrapeExport" onclick="exportScrapeCSV()" disabled>Exporter CSV</button>
+      <span class="count-info" id="scrapeCountInfo"></span>
+    </div>
+
+    <div class="progress-bar" id="scrapeProgressBar"><div class="fill" id="scrapeProgressFill"></div></div>
+    <div class="progress-text" id="scrapeProgressText"></div>
+    <div class="scrape-current" id="scrapeCurrent"></div>
+
+    <div class="stats" id="scrapeStats">
+      <div class="stat valid"><div class="num" id="sDomains">0</div><div class="label">Domaines</div></div>
+      <div class="stat valid"><div class="num" id="sEmails">0</div><div class="label">Emails vérifiés</div></div>
+      <div class="stat catchall"><div class="num" id="sHigh">0</div><div class="label">Score ≥ 80</div></div>
+      <div class="stat unknown"><div class="num" id="sErrors">0</div><div class="label">Erreurs</div></div>
+    </div>
+
+    <div class="results" id="scrapeResults"></div>
   </div>
-
-  <div class="results" id="results"></div>
 </div>
 <script>
 var currentJobId = null;
@@ -969,6 +1171,215 @@ dropZone.addEventListener('drop', function(e) {
 });
 document.addEventListener('dragover', function(e) { e.preventDefault(); });
 document.addEventListener('drop', function(e) { e.preventDefault(); });
+
+// ═══════════════════════════════════════════════════════════════════
+//   SCRAPER TAB — état + polling isolés du Checker
+//   Rendu 100% via DOM APIs (createElement / textContent) pour éviter XSS
+// ═══════════════════════════════════════════════════════════════════
+var scrapeJobId = null;
+var scrapePoll = null;
+var scrapeLastResultCount = 0;
+var scrapeLastChecked = 0;
+var scrapeTotal = 0;
+
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(function(t) {
+    t.classList.toggle('active', t.dataset.tab === name);
+  });
+  document.querySelectorAll('.tab-panel').forEach(function(p) {
+    p.classList.toggle('active', p.id === 'panel-' + name);
+  });
+}
+
+function countDomains() {
+  var raw = document.getElementById('domainInput').value;
+  var matches = raw.match(/(?:https?:\/\/)?(?:www\.)?([a-z0-9][a-z0-9\-]{0,62}(?:\.[a-z0-9][a-z0-9\-]{0,62})+)/gi) || [];
+  var seen = new Set();
+  matches.forEach(function(m) {
+    var d = m.replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].toLowerCase();
+    if (d) seen.add(d);
+  });
+  var n = seen.size;
+  document.getElementById('scrapeCountInfo').textContent = n ? n + ' domaine' + (n > 1 ? 's' : '') + ' détecté' + (n > 1 ? 's' : '') : '';
+  return n;
+}
+
+function clearChildren(el) {
+  while (el.firstChild) el.removeChild(el.firstChild);
+}
+
+function startScrape() {
+  var raw = document.getElementById('domainInput').value.trim();
+  if (!raw) return;
+  if (scrapePoll) { clearInterval(scrapePoll); scrapePoll = null; }
+
+  document.getElementById('btnScrape').disabled = true;
+  document.getElementById('btnScrape').textContent = 'Scraping...';
+  document.getElementById('btnScrapeExport').disabled = true;
+  clearChildren(document.getElementById('scrapeResults'));
+  document.getElementById('scrapeProgressBar').style.display = 'block';
+  document.getElementById('scrapeProgressText').style.display = 'block';
+  document.getElementById('scrapeStats').style.display = 'flex';
+  document.getElementById('scrapeProgressFill').style.width = '0%';
+  document.getElementById('scrapeProgressText').textContent = 'Démarrage...';
+  document.getElementById('scrapeCurrent').style.display = 'none';
+  scrapeLastResultCount = 0;
+  scrapeLastChecked = 0;
+  updateScrapeStats([], 0);
+
+  fetch('/api/scrape', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({domains: raw})
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(data) {
+    if (data.error) { alert(data.error); resetScrapeBtn(); return; }
+    scrapeJobId = data.job_id;
+    scrapeTotal = data.total;
+    document.getElementById('scrapeCountInfo').textContent = data.total + ' domaine' + (data.total > 1 ? 's' : '');
+    scrapePoll = setInterval(pollScrapeStatus, 1500);
+  })
+  .catch(function(err) { alert('Erreur réseau: ' + err.message); resetScrapeBtn(); });
+}
+
+function resetScrapeBtn() {
+  document.getElementById('btnScrape').disabled = false;
+  document.getElementById('btnScrape').textContent = 'Scraper';
+}
+
+function pollScrapeStatus() {
+  if (!scrapeJobId) return;
+  fetch('/api/scrape/status/' + scrapeJobId)
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (data.error) { clearInterval(scrapePoll); resetScrapeBtn(); return; }
+
+      var pct = scrapeTotal > 0 ? (data.checked / scrapeTotal * 100).toFixed(0) : 0;
+      document.getElementById('scrapeProgressFill').style.width = pct + '%';
+      document.getElementById('scrapeProgressText').textContent =
+        data.checked + ' / ' + scrapeTotal + ' domaine' + (scrapeTotal > 1 ? 's' : '') + ' (' + pct + '%) — ' + data.results.length + ' emails trouvés';
+
+      if (data.current) {
+        var el = document.getElementById('scrapeCurrent');
+        el.style.display = 'block';
+        el.textContent = '🔍 En cours : ' + data.current;
+      } else {
+        document.getElementById('scrapeCurrent').style.display = 'none';
+      }
+
+      if (data.results.length !== scrapeLastResultCount || data.checked !== scrapeLastChecked) {
+        renderScrapeGrouped(data.results, data.errors || []);
+        scrapeLastResultCount = data.results.length;
+        scrapeLastChecked = data.checked;
+      }
+
+      updateScrapeStats(data.results, (data.errors || []).length);
+
+      if (data.done) {
+        clearInterval(scrapePoll);
+        scrapePoll = null;
+        resetScrapeBtn();
+        document.getElementById('btnScrapeExport').disabled = data.results.length === 0;
+        document.getElementById('scrapeProgressFill').style.width = '100%';
+        document.getElementById('scrapeProgressText').textContent =
+          'Terminé ! ' + data.results.length + ' email' + (data.results.length > 1 ? 's' : '') + ' vérifié' + (data.results.length > 1 ? 's' : '') + ' sur ' + scrapeTotal + ' domaine' + (scrapeTotal > 1 ? 's' : '');
+        document.getElementById('scrapeCurrent').style.display = 'none';
+      }
+    })
+    .catch(function() {});
+}
+
+function makeEl(tag, className, text) {
+  var el = document.createElement(tag);
+  if (className) el.className = className;
+  if (text !== undefined) el.textContent = text;
+  return el;
+}
+
+function renderScrapeGrouped(results, errors) {
+  var container = document.getElementById('scrapeResults');
+  clearChildren(container);
+
+  var byDomain = {};
+  results.forEach(function(r) {
+    if (!byDomain[r.domain]) byDomain[r.domain] = [];
+    byDomain[r.domain].push(r);
+  });
+
+  Object.keys(byDomain).sort().forEach(function(dom) {
+    var emails = byDomain[dom];
+    emails.sort(function(a, b) { return (b.score || 0) - (a.score || 0); });
+
+    var grp = makeEl('div', 'scrape-domain-group');
+    var head = makeEl('div', 'dh');
+    head.appendChild(makeEl('span', null, '🌐 ' + dom));
+    head.appendChild(makeEl('span', 'cnt', emails.length + ' email' + (emails.length > 1 ? 's' : '')));
+    grp.appendChild(head);
+
+    emails.forEach(function(r) {
+      var row = makeEl('div', 'email-row');
+      var sc = parseInt(r.score || 0);
+      var scClass = sc >= 80 ? 'score-mini' : sc >= 60 ? 'score-mini mid' : 'score-mini low';
+      row.appendChild(makeEl('div', scClass, String(sc)));
+      row.appendChild(makeEl('span', 'em', r.email));
+      if (r.name) row.appendChild(makeEl('span', 'nm', '— ' + r.name));
+      row.appendChild(makeEl('span', 'src', r.sources || ''));
+      grp.appendChild(row);
+    });
+
+    container.appendChild(grp);
+  });
+
+  errors.forEach(function(e) {
+    var err = makeEl('div', 'scrape-domain-group');
+    err.style.borderLeft = '4px solid #ff3b30';
+    var head = makeEl('div', 'dh');
+    head.appendChild(makeEl('span', null, '❌ ' + e.domain));
+    var msg = makeEl('span', null, e.error);
+    msg.style.color = '#ff3b30';
+    msg.style.fontSize = '12px';
+    head.appendChild(msg);
+    err.appendChild(head);
+    container.appendChild(err);
+  });
+}
+
+function updateScrapeStats(results, errCount) {
+  var domains = new Set();
+  var high = 0;
+  results.forEach(function(r) {
+    domains.add(r.domain);
+    if (parseInt(r.score || 0) >= 80) high++;
+  });
+  document.getElementById('sDomains').textContent = domains.size;
+  document.getElementById('sEmails').textContent = results.length;
+  document.getElementById('sHigh').textContent = high;
+  document.getElementById('sErrors').textContent = errCount;
+}
+
+function clearScrape() {
+  if (scrapePoll) { clearInterval(scrapePoll); scrapePoll = null; }
+  scrapeJobId = null;
+  scrapeLastResultCount = 0;
+  scrapeLastChecked = 0;
+  scrapeTotal = 0;
+  document.getElementById('domainInput').value = '';
+  clearChildren(document.getElementById('scrapeResults'));
+  document.getElementById('scrapeProgressBar').style.display = 'none';
+  document.getElementById('scrapeProgressText').style.display = 'none';
+  document.getElementById('scrapeStats').style.display = 'none';
+  document.getElementById('scrapeCurrent').style.display = 'none';
+  document.getElementById('scrapeCountInfo').textContent = '';
+  resetScrapeBtn();
+  document.getElementById('btnScrapeExport').disabled = true;
+}
+
+function exportScrapeCSV() {
+  if (scrapeJobId) window.location = '/api/scrape/export/' + scrapeJobId;
+}
+
+document.getElementById('domainInput').addEventListener('input', countDomains);
 </script>
 </body>
 </html>

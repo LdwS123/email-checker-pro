@@ -678,43 +678,70 @@ def scrape_export(job_id):
 
 @app.route("/api/scrape/single", methods=["GET", "POST"])
 def scrape_single():
-    """Synchronous single-domain scrape for the bookmarklet / CLI.
-    GET  /api/scrape/single?domain=acme.com  → JSON with results
-    POST /api/scrape/single  { "domain": "acme.com" } → same JSON
-    Blocks up to ~90s; return partial on timeout."""
+    """Single-domain scrape.
+
+    Render free tier has a ~30s proxy timeout, and a full harvest takes
+    40-60s, so sync mode reliably returns 502. Default behaviour is now
+    async: kick off a job and return {job_id, total}. Pass ?wait=1 to
+    force the old synchronous mode (useful locally / self-hosted).
+    """
     if not SCRAPER_AVAILABLE:
         return jsonify({"error": f"Scraper unavailable: {_SCRAPER_IMPORT_ERROR}"}), 503
     json_body = request.get_json(silent=True) or {}
     raw = request.args.get("domain") or json_body.get("domain") or ""
+    wait = (request.args.get("wait") or json_body.get("wait") or "0") in ("1", "true", "yes")
     domains = parse_domains(raw)
     if not domains:
         return jsonify({"error": "No valid domain"}), 400
     domain = domains[0]
-    try:
-        results, sources, founders = harvest_domain(domain, verbose=False)
-    except Exception as e:
-        return jsonify({"error": str(e), "domain": domain}), 500
-    return jsonify({
-        "domain": domain,
-        "count": len(results),
-        "sources": sources,
-        "founders": founders,
-        "emails": results,
-    })
+
+    if wait:
+        try:
+            results, sources, founders = harvest_domain(domain, verbose=False)
+        except Exception as e:
+            return jsonify({"error": str(e), "domain": domain}), 500
+        return jsonify({
+            "domain": domain,
+            "count": len(results),
+            "sources": sources,
+            "founders": founders,
+            "emails": results,
+        })
+
+    # Async: reuse the existing /api/scrape job machinery
+    global job_counter
+    with job_lock:
+        job_counter += 1
+        job_id = f"s{job_counter}"
+        jobs[job_id] = {
+            "type": "scrape",
+            "domains": [domain],
+            "total": 1,
+            "checked_domains": 0,
+            "results": [],
+            "errors": [],
+            "current": None,
+            "sources_summary": {},
+            "done": False,
+        }
+    Thread(target=process_scrape_job, args=(job_id, [domain]), daemon=True).start()
+    return jsonify({"job_id": job_id, "total": 1, "domain": domain})
 
 
 @app.route("/bookmarklet")
 def bookmarklet_page():
-    """Serves a tiny landing page with a drag-to-bookmarks-bar bookmarklet
-    that scrapes the domain of whatever site the user is currently on."""
+    """Serves a tiny landing page with a drag-to-bookmarks-bar bookmarklet.
+    Clicking the bookmark on any site opens the main UI with the current
+    hostname pre-filled and the scrape auto-started — so the user sees
+    the progress bar instead of a 502 from Render's 30s proxy cap."""
     base = request.url_root.rstrip("/")
+    # Send the user to the Scraper tab with ?scrape=<domain>&auto=1
     js = (
         "(function(){"
         "var d=location.hostname.replace(/^www\\./,'');"
-        f"window.open('{base}/api/scrape/single?domain='+encodeURIComponent(d),'_blank');"
+        f"window.open('{base}/?tab=scraper&scrape='+encodeURIComponent(d)+'&auto=1','_blank');"
         "})();"
     )
-    # javascript: URL for the <a href>
     href = "javascript:" + js.replace(" ", "%20")
     html = f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>Bookmarklet — Ultra Scraper</title>
@@ -1438,6 +1465,23 @@ function exportScrapeCSV() {
 }
 
 document.getElementById('domainInput').addEventListener('input', countDomains);
+
+// Bookmarklet deep-link: /?tab=scraper&scrape=<domain>&auto=1
+(function() {
+  var params = new URLSearchParams(window.location.search);
+  var tab = params.get('tab');
+  var seed = params.get('scrape');
+  var auto = params.get('auto');
+  if (tab === 'scraper') switchTab('scraper');
+  if (seed) {
+    var ta = document.getElementById('domainInput');
+    ta.value = seed;
+    countDomains();
+    if (auto === '1') {
+      setTimeout(function() { startScrape(); }, 150);
+    }
+  }
+})();
 </script>
 </body>
 </html>

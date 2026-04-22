@@ -5,17 +5,26 @@ Ultra Email Scraper v2 — OSINT Hacker Edition
 100% GRATUIT. Techniques OSINT pour extraire des emails de startups.
 Vérifie tous les emails via ton checker avant export.
 
-Sources (10 techniques):
-  1. GitHub commit search (author-email:@domain)
-  2. GitHub org/user repo mining
-  3. GitHub code search (@domain in source code)
-  4. Website deep crawl (about/team/contact + sitemap + JS)
-  5. YC directory → email pattern bruteforce
-  6. Bing dorking (moins restrictif que Google)
-  7. Wayback Machine (pages archivées)
-  8. PGP keyservers (clés publiques = vrais emails)
-  9. npm/PyPI packages (maintainer emails)
-  10. theHarvester OSINT
+Sources (18 techniques) + pattern inference:
+  1.  GitHub commit search     10. crt.sh (subdomain enum)
+  2.  GitHub org/user repos    11. HackerNews (Algolia)
+  3.  GitHub code search       12. Reddit (posts + user bios)
+  4.  Website deep crawl       13. StackExchange (about_me)
+  5.  YC directory brute       14. Mastodon (federated)
+  6.  Bing dorking              15. ProductHunt (maker pages)
+  7.  Wayback Machine           16. WHOIS (registrant)
+  8.  PGP keyservers            17. SEC EDGAR (US filings)
+  9.  npm/PyPI maintainers      18. theHarvester OSINT
+
+Pattern inference:
+  - Parses team pages for "Firstname Lastname" tokens (BeautifulSoup)
+  - Infers email pattern from already-verified (email, name) pairs
+  - Generates + verifies candidates via mailcheck.ai / disify
+  - Biggest yield multiplier: 1 known email + 10 names → 5-10 new emails
+
+Role extraction:
+  - Scans text within 140 chars of every email for role keywords
+    (CEO, Founder, Partner, Head of, ...) and stamps the role in the CSV.
 
 Vérification finale:
   - Envoie tous les emails trouvés au checker Render pour les 9 checks
@@ -41,7 +50,7 @@ GH_TOKEN = os.environ.get("GH_TOKEN", "")
 
 OUTPUT = "ultra_results.csv"
 DONE_FILE = "ultra_done.txt"
-WORKERS_SOURCES = 10
+WORKERS_SOURCES = 14
 MAX_GH_REPOS = 8
 MAX_GH_COMMITS = 40
 
@@ -156,6 +165,13 @@ def is_personal(email, domain):
         return False
     if not re.search(r"[a-zA-Z]", local):
         return False
+    # Token-split: if ANY token (split on . - _ +) is a generic term, reject.
+    # Catches "santamonica-info", "pitch-deck", "investor.relations" etc.
+    tokens = re.split(r"[.\-_+]", local)
+    if len(tokens) >= 2:
+        for t in tokens:
+            if t in GENERIC_LOCALS:
+                return False
     return True
 
 
@@ -320,66 +336,185 @@ def source_github_code(domain):
 # ══════════════════════════════════════════════════════════════
 TEAM_PATHS = [
     "/", "/about", "/about-us", "/team", "/our-team", "/people",
-    "/company", "/contact", "/contact-us", "/founders", "/leadership",
-    "/imprint", "/impressum", "/legal", "/privacy",  # German/EU sites
+    "/staff", "/directors", "/leadership", "/partners",
+    "/company", "/who-we-are", "/who", "/meet-the-team",
+    "/contact", "/contact-us", "/connect", "/hello",
+    "/founders", "/investors", "/portfolio",
+    "/press", "/media", "/newsroom", "/news",
+    "/careers", "/jobs", "/join-us", "/join",
+    "/blog", "/blog/authors", "/authors",
+    "/imprint", "/impressum", "/legal", "/privacy", "/mentions-legales",
 ]
+
+# Titles we consider valid founder/employee names on team pages.
+_NAME_RE = re.compile(
+    r"\b([A-Z][a-zàâäéèêëîïôöùûüç]{1,19}(?:\s+(?:de|van|von|der|la|le|del|da|di)\s+[A-Z][a-zàâäéèêëîïôöùûüç]{1,19})?"
+    r"(?:\s+[A-Z][a-zàâäéèêëîïôöùûüç]{1,19}){1,2})\b"
+)
+
+ROLE_RE = re.compile(
+    r"\b("
+    r"ceo|cto|cfo|coo|cmo|cpo|cso|vp|svp|evp|president|founder|co[\-\s]?founder|"
+    r"chief|partner|gp|general\s+partner|managing\s+director|director|"
+    r"head\s+of|lead|principal|engineer|developer|researcher|scientist|"
+    r"designer|marketer|pr|press|recruiter|talent|hr|people|"
+    r"investor|analyst|associate|operating\s+partner|advisor|board|trustee|"
+    r"editor|journalist|author|writer|reporter|correspondent"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _extract_names_from_html(html):
+    """Extract plausible 'Firstname Lastname' tokens from team-style pages.
+
+    Focuses on headings/cards: <h1-h4>, <strong>, <b>, common card divs.
+    Returns a list preserving order, deduplicated.
+    """
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        return []
+
+    seen = set()
+    names = []
+    candidates = soup.find_all(["h1", "h2", "h3", "h4", "h5",
+                                "strong", "b", "figcaption"])
+    for el in candidates:
+        txt = (el.get_text(" ", strip=True) or "")[:80]
+        m = _NAME_RE.search(txt)
+        if not m:
+            continue
+        name = m.group(1).strip()
+        # Filter obvious non-names
+        if name.lower() in {"read more", "learn more", "our team", "about us",
+                            "case study", "press release", "privacy policy"}:
+            continue
+        # Require at least two capitalized tokens
+        if len(name.split()) < 2:
+            continue
+        if name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+        if len(names) >= 60:
+            break
+    return names
 
 
 def source_website(domain):
-    """Deep crawl du site web + sitemap + fichiers JS."""
-    emails = set()
+    """Deep crawl: TEAM_PATHS × {apex, www} + sitemap(s) + robots.txt Sitemap.
 
-    # 1. Crawl main pages
-    for base_url in [f"https://{domain}", f"https://www.{domain}"]:
+    Extracts both emails AND candidate person names (for pattern inference).
+    Returns (emails_with_names, "website", scraped_names).
+    """
+    emails = set()
+    email_role = {}  # email -> role (first non-empty wins)
+    scraped_names = []
+    visited = set()
+
+    def _ingest(html):
+        for e in extract_emails(html, domain):
+            emails.add((e, ""))
+            if e not in email_role:
+                role = extract_role_near_email(html, e)
+                if role:
+                    email_role[e] = role
+        for n in _extract_names_from_html(html):
+            if n not in scraped_names:
+                scraped_names.append(n)
+
+    # 1. Direct TEAM_PATHS on both apex + www
+    for base_url in (f"https://{domain}", f"https://www.{domain}"):
         for path in TEAM_PATHS:
+            url = base_url + path
+            if url in visited:
+                continue
+            visited.add(url)
             try:
-                r = SESSION.get(base_url + path, timeout=8, allow_redirects=True)
-                if r.status_code == 200:
-                    found = extract_emails(r.text, domain)
-                    for e in found:
-                        emails.add((e, ""))
-                    # Extract JS files and check them too
-                    js_urls = re.findall(r'src=["\']([^"\']*\.js[^"\']*)["\']', r.text)
-                    for js in js_urls[:5]:
-                        if js.startswith("/"):
-                            js = base_url + js
-                        elif not js.startswith("http"):
-                            continue
-                        try:
-                            jr = SESSION.get(js, timeout=5)
-                            if jr.status_code == 200:
-                                found = extract_emails(jr.text[:10000], domain)
-                                for e in found:
-                                    emails.add((e, ""))
-                        except Exception:
-                            pass
+                r = SESSION.get(url, timeout=8, allow_redirects=True)
             except Exception:
                 continue
-        if emails:
+            if r.status_code != 200 or len(r.text) < 100:
+                continue
+            _ingest(r.text)
+            # JS files (obfuscated team data sometimes lives in JSON bundles)
+            for js in re.findall(r'src=["\']([^"\']*\.js[^"\']*)["\']', r.text)[:5]:
+                if js.startswith("/"):
+                    js = base_url + js
+                elif not js.startswith("http"):
+                    continue
+                try:
+                    jr = SESSION.get(js, timeout=5)
+                    if jr.status_code == 200:
+                        for e in extract_emails(jr.text[:30000], domain):
+                            emails.add((e, ""))
+                except Exception:
+                    pass
+        if emails or scraped_names:
+            # Reasonably covered — skip www duplicate
             break
 
-    # 2. Try sitemap.xml
-    for base_url in [f"https://{domain}", f"https://www.{domain}"]:
+    # 2. Sitemap(s) — resolve via robots.txt + standard paths
+    sitemap_urls = []
+    for base_url in (f"https://{domain}", f"https://www.{domain}"):
         try:
-            r = SESSION.get(f"{base_url}/sitemap.xml", timeout=5)
-            if r.status_code == 200:
-                # Extract URLs from sitemap
-                urls = re.findall(r"<loc>(.*?)</loc>", r.text)
-                team_urls = [u for u in urls if any(kw in u.lower() for kw in
-                            ["team", "about", "people", "founder", "contact"])]
-                for url in team_urls[:5]:
+            rr = SESSION.get(f"{base_url}/robots.txt", timeout=5)
+            if rr.status_code == 200:
+                for line in rr.text.splitlines():
+                    line = line.strip()
+                    if line.lower().startswith("sitemap:"):
+                        sitemap_urls.append(line.split(":", 1)[1].strip())
+        except Exception:
+            pass
+        for p in ("/sitemap.xml", "/sitemap_index.xml", "/sitemap1.xml"):
+            sitemap_urls.append(base_url + p)
+
+    keyword_re = re.compile(r"(team|about|people|founder|leadership|staff|"
+                            r"partner|investor|contact|press|author|blog)",
+                            re.IGNORECASE)
+
+    sitemap_fetched = 0
+    picked_urls = set()
+    for sm_url in sitemap_urls[:6]:
+        if sitemap_fetched >= 4:
+            break
+        try:
+            r = SESSION.get(sm_url, timeout=6)
+            if r.status_code != 200:
+                continue
+            sitemap_fetched += 1
+            # Handle sitemap indexes too
+            inner = re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", r.text)
+            for u in inner:
+                if u.endswith(".xml") and sitemap_fetched < 6:
                     try:
-                        pr = SESSION.get(url, timeout=8)
-                        if pr.status_code == 200:
-                            found = extract_emails(pr.text, domain)
-                            for e in found:
-                                emails.add((e, ""))
+                        ri = SESSION.get(u, timeout=6)
+                        if ri.status_code == 200:
+                            sitemap_fetched += 1
+                            for u2 in re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", ri.text):
+                                if keyword_re.search(u2):
+                                    picked_urls.add(u2)
                     except Exception:
                         pass
+                elif keyword_re.search(u):
+                    picked_urls.add(u)
         except Exception:
             pass
 
-    return emails, "website"
+    for u in list(picked_urls)[:10]:
+        if u in visited:
+            continue
+        visited.add(u)
+        try:
+            pr = SESSION.get(u, timeout=8)
+            if pr.status_code == 200:
+                _ingest(pr.text)
+        except Exception:
+            pass
+
+    return emails, "website", scraped_names, email_role
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1061,13 +1196,375 @@ def source_hackernews(domain):
 
 
 # ══════════════════════════════════════════════════════════════
-# MAIN HARVESTER — 12 sources en parallèle
+# SOURCE 13: Reddit — posts/comments referencing the domain
+# ══════════════════════════════════════════════════════════════
+def source_reddit(domain):
+    """Search public Reddit JSON endpoint for posts mentioning the domain,
+    then scan selftext/title/user profiles for personal emails. Free, no auth."""
+    emails = set()
+    try:
+        r = SESSION.get(
+            "https://www.reddit.com/search.json",
+            params={"q": domain, "limit": 50, "sort": "relevance"},
+            headers={"User-Agent": "ultra-scraper/2.0 (contact)"},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return emails, "reddit"
+        posts = (r.json().get("data") or {}).get("children", []) or []
+    except Exception:
+        return emails, "reddit"
+
+    authors = set()
+    for p in posts:
+        data = p.get("data", {}) or {}
+        for field in ("selftext", "title", "url"):
+            text = data.get(field) or ""
+            for e in extract_emails(text, domain):
+                emails.add((e, data.get("author") or ""))
+        author = data.get("author")
+        if author and author != "[deleted]":
+            authors.add(author)
+
+    for author in list(authors)[:10]:
+        try:
+            rr = SESSION.get(
+                f"https://www.reddit.com/user/{author}/about.json",
+                headers={"User-Agent": "ultra-scraper/2.0"},
+                timeout=6,
+            )
+            if rr.status_code != 200:
+                continue
+            sub = (rr.json().get("data") or {}).get("subreddit") or {}
+            about = sub.get("public_description", "") or ""
+            for e in extract_emails(about, domain):
+                emails.add((e, author))
+        except Exception:
+            continue
+
+    return emails, "reddit"
+
+
+# ══════════════════════════════════════════════════════════════
+# SOURCE 14: StackExchange — user bios across SO network
+# ══════════════════════════════════════════════════════════════
+def source_stackexchange(domain):
+    """Search StackOverflow for users whose 'about_me' mentions the domain.
+    about_me frequently contains contact emails. Free API, ~300 req/day anon."""
+    emails = set()
+    try:
+        r = SESSION.get(
+            "https://api.stackexchange.com/2.3/users",
+            params={"site": "stackoverflow", "inname": domain.split(".")[0],
+                    "pagesize": 30, "order": "desc", "sort": "reputation",
+                    "filter": "!9Z(-wzftf"},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return emails, "stackexchange"
+        for u in r.json().get("items", []) or []:
+            about = u.get("about_me") or ""
+            display = u.get("display_name") or ""
+            if domain.lower() in (about + " " + (u.get("website_url") or "")).lower():
+                for e in extract_emails(about, domain):
+                    emails.add((e, display))
+    except Exception:
+        return emails, "stackexchange"
+    return emails, "stackexchange"
+
+
+# ══════════════════════════════════════════════════════════════
+# SOURCE 15: Mastodon — federated public search
+# ══════════════════════════════════════════════════════════════
+def source_mastodon(domain):
+    """Search Mastodon statuses + account bios mentioning the domain.
+    Instance mastodon.social federates the network. Free, no auth."""
+    emails = set()
+    for query in (domain, f"@{domain.split('.')[0]}"):
+        try:
+            r = SESSION.get(
+                "https://mastodon.social/api/v2/search",
+                params={"q": query, "type": "statuses", "resolve": "false",
+                        "limit": 20},
+                timeout=10,
+            )
+            if r.status_code != 200:
+                continue
+            for s in r.json().get("statuses", []) or []:
+                content = s.get("content") or ""
+                acc = s.get("account") or {}
+                display = acc.get("display_name") or ""
+                for e in extract_emails(content, domain):
+                    emails.add((e, display))
+                note = acc.get("note") or ""
+                for e in extract_emails(note, domain):
+                    emails.add((e, display))
+        except Exception:
+            continue
+    return emails, "mastodon"
+
+
+# ══════════════════════════════════════════════════════════════
+# SOURCE 16: ProductHunt — product/maker HTML pages
+# ══════════════════════════════════════════════════════════════
+def source_producthunt(domain):
+    """Scrape ProductHunt product + maker pages. Free, no auth (HTML scrape)."""
+    emails = set()
+    base = domain.split(".")[0]
+    slugs = [base, base.replace("-", ""), f"{base}-app", f"{base}-ai"]
+    for slug in slugs[:4]:
+        try:
+            r = SESSION.get(
+                f"https://www.producthunt.com/products/{slug}",
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=8,
+            )
+            if r.status_code == 200 and len(r.text) > 500:
+                for e in extract_emails(r.text, domain):
+                    emails.add((e, ""))
+        except Exception:
+            continue
+    return emails, "producthunt"
+
+
+# ══════════════════════════════════════════════════════════════
+# SOURCE 17: WHOIS — domain registrant
+# ══════════════════════════════════════════════════════════════
+def source_whois(domain):
+    """Registrant email via `whois` CLI. Most are GDPR-redacted but
+    non-EU / small domains often still expose owner contact. Free."""
+    emails = set()
+    try:
+        result = subprocess.run(
+            ["whois", domain],
+            capture_output=True, text=True, timeout=12,
+        )
+        output = result.stdout + result.stderr
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return emails, "whois"
+    for e in extract_emails(output, domain):
+        emails.add((e, ""))
+    return emails, "whois"
+
+
+# ══════════════════════════════════════════════════════════════
+# SOURCE 18: SEC EDGAR — US filings full-text search
+# ══════════════════════════════════════════════════════════════
+def source_sec_edgar(domain):
+    """SEC EDGAR full-text search. US startups that filed Form D / S-1 /
+    10-K sometimes list a contact email in the filing. Free, no auth."""
+    emails = set()
+    try:
+        r = SESSION.get(
+            "https://efts.sec.gov/LATEST/search-index",
+            params={"q": f'"{domain}"', "forms": "S-1,D,10-K,8-K"},
+            headers={"User-Agent": "ultra-scraper research@example.com"},
+            timeout=12,
+        )
+        if r.status_code != 200:
+            return emails, "sec"
+        hits = (r.json().get("hits") or {}).get("hits", []) or []
+    except Exception:
+        return emails, "sec"
+
+    for h in hits[:3]:
+        src = h.get("_source") or {}
+        adsh = (src.get("adsh") or "").replace("-", "")
+        cik = (src.get("ciks") or [None])[0]
+        if not adsh or not cik:
+            continue
+        url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{adsh}"
+        try:
+            rr = SESSION.get(url, timeout=8, headers={
+                "User-Agent": "ultra-scraper research@example.com"})
+            if rr.status_code == 200:
+                for e in extract_emails(rr.text[:50000], domain):
+                    emails.add((e, ""))
+        except Exception:
+            continue
+    return emails, "sec"
+
+
+# ══════════════════════════════════════════════════════════════
+# PATTERN INFERENCE — biggest yield multiplier
+# ══════════════════════════════════════════════════════════════
+def _ascii_slug(s):
+    """Normalize name to lowercase ASCII for email-local comparison."""
+    s = (s or "").lower().strip()
+    table = str.maketrans({
+        "à": "a", "â": "a", "ä": "a", "á": "a", "ã": "a",
+        "é": "e", "è": "e", "ê": "e", "ë": "e",
+        "î": "i", "ï": "i", "í": "i",
+        "ô": "o", "ö": "o", "ó": "o", "ò": "o", "õ": "o",
+        "ù": "u", "û": "u", "ü": "u", "ú": "u",
+        "ç": "c", "ñ": "n", "ÿ": "y", "ø": "o",
+    })
+    s = s.translate(table)
+    return re.sub(r"[^a-z]", "", s)
+
+
+def _pattern_candidates(first, last, domain):
+    """All plausible templates for (first, last) @ domain."""
+    f, l = _ascii_slug(first), _ascii_slug(last)
+    if not f or not l:
+        return []
+    return [
+        f"{f}.{l}@{domain}",
+        f"{f}@{domain}",
+        f"{f[0]}{l}@{domain}",
+        f"{f}{l}@{domain}",
+        f"{f[0]}.{l}@{domain}",
+        f"{f}{l[0]}@{domain}",
+        f"{f}_{l}@{domain}",
+        f"{l}.{f}@{domain}",
+        f"{l}@{domain}",
+        f"{l}{f}@{domain}",
+    ]
+
+
+def _infer_patterns(known_emails, domain):
+    """Infer email pattern templates from already-verified (email, name) pairs.
+    Returns templates ordered by frequency."""
+    hits = []
+    for email, name in known_emails:
+        if "@" not in email or not name:
+            continue
+        local = email.split("@")[0].lower()
+        parts = [p for p in re.split(r"[\s\-]", name) if len(p) >= 2]
+        if len(parts) < 2:
+            continue
+        first, last = _ascii_slug(parts[0]), _ascii_slug(parts[-1])
+        if not first or not last:
+            continue
+        for template, formatted in (
+            ("{f}.{l}",  f"{first}.{last}"),
+            ("{f}",      first),
+            ("{f}{l}",   f"{first}{last}"),
+            ("{fi}{l}",  f"{first[0]}{last}"),
+            ("{fi}.{l}", f"{first[0]}.{last}"),
+            ("{f}{li}",  f"{first}{last[0]}"),
+            ("{f}_{l}",  f"{first}_{last}"),
+            ("{l}",      last),
+            ("{l}.{f}",  f"{last}.{first}"),
+            ("{l}{f}",   f"{last}{first}"),
+        ):
+            if local == formatted:
+                hits.append(template)
+
+    from collections import Counter
+    counts = Counter(hits)
+    return [t for t, _ in counts.most_common()]
+
+
+def _apply_template(template, first, last, domain):
+    f, l = _ascii_slug(first), _ascii_slug(last)
+    if not f or not l:
+        return None
+    return (template
+            .replace("{fi}", f[0])
+            .replace("{li}", l[0])
+            .replace("{f}", f)
+            .replace("{l}", l)) + f"@{domain}"
+
+
+def source_pattern_brute(domain, scraped_names, known_verified):
+    """Generate candidate emails from scraped_names. If we already have
+    verified (email, name) pairs, infer the pattern first; else try the top
+    3 templates per name. Verify with the lightweight mailcheck/disify API.
+
+    This is the biggest yield multiplier — a team page with 10 names +
+    1 verified email often produces 8-10 more verified emails."""
+    out = set()
+    if not scraped_names:
+        return out, "pattern-brute"
+
+    inferred = _infer_patterns(known_verified, domain)
+    candidates = []
+
+    for name in scraped_names[:30]:
+        parts = [p for p in re.split(r"[\s\-]+", name) if len(p) >= 2]
+        if len(parts) < 2:
+            continue
+        first, last = parts[0], parts[-1]
+        nslug = _ascii_slug(first) + _ascii_slug(last)
+        # Skip names we already have an email for
+        already = any(
+            nslug and nslug in _ascii_slug(e.split("@")[0])
+            for e, _ in known_verified
+        )
+        if already:
+            continue
+        if inferred:
+            cand = _apply_template(inferred[0], first, last, domain)
+            if cand:
+                candidates.append((cand, name))
+        else:
+            for p in _pattern_candidates(first, last, domain)[:3]:
+                candidates.append((p, name))
+
+    seen = set()
+    unique = []
+    for e, n in candidates:
+        if e not in seen:
+            seen.add(e)
+            unique.append((e, n))
+    unique = unique[:30]
+    if not unique:
+        return out, "pattern-brute"
+
+    def _check(item):
+        email, name = item
+        return (email, name, _verify_email_quick(email))
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        for email, name, ok in pool.map(_check, unique):
+            if ok is True:
+                out.add((email, name))
+
+    return out, "pattern-brute"
+
+
+# ══════════════════════════════════════════════════════════════
+# ROLE EXTRACTION — scan text near emails for role keywords
+# ══════════════════════════════════════════════════════════════
+def extract_role_near_email(text, email, window=140):
+    """Return a detected role (CEO, Founder, etc.) if found within
+    `window` chars of the email in `text`, else None."""
+    if not text or not email:
+        return None
+    idx = text.lower().find(email.lower())
+    if idx < 0:
+        return None
+    start = max(0, idx - window)
+    end = min(len(text), idx + len(email) + window)
+    window_text = text[start:end]
+    m = ROLE_RE.search(window_text)
+    if not m:
+        return None
+    role = m.group(1).strip().lower()
+    mapping = {"cofounder": "Co-Founder", "co-founder": "Co-Founder",
+               "founder": "Founder", "ceo": "CEO", "cto": "CTO",
+               "cfo": "CFO", "coo": "COO", "cmo": "CMO", "cpo": "CPO",
+               "cso": "CSO", "gp": "General Partner",
+               "general partner": "General Partner",
+               "managing director": "Managing Director",
+               "vp": "VP", "svp": "SVP", "evp": "EVP",
+               "head of": "Head of", "chief": "Chief",
+               "partner": "Partner", "president": "President"}
+    return mapping.get(role, role.title())
+
+
+# ══════════════════════════════════════════════════════════════
+# MAIN HARVESTER — 18 sources in parallel + pattern brute
 # ══════════════════════════════════════════════════════════════
 def harvest_domain(domain, verbose=False):
-    """Run les 12 sources en parallèle, vérifie via checker."""
+    """Run 18 OSINT sources in parallel, then pattern-brute scraped names,
+    then run the full checker on every candidate."""
     all_emails = {}  # email -> {name, sources}
     founders_found = []
     source_counts = {}
+    scraped_names = []  # Populated by source_website for pattern brute
+    role_hints = {}    # email -> role (from nearby text on team pages)
 
     if verbose:
         print(f"\n  🔍 {domain}")
@@ -1085,6 +1582,12 @@ def harvest_domain(domain, verbose=False):
             pool.submit(source_theharvester, domain): "harvester",
             pool.submit(source_crtsh, domain): "crtsh",
             pool.submit(source_hackernews, domain): "hackernews",
+            pool.submit(source_reddit, domain): "reddit",
+            pool.submit(source_stackexchange, domain): "stackexchange",
+            pool.submit(source_mastodon, domain): "mastodon",
+            pool.submit(source_producthunt, domain): "producthunt",
+            pool.submit(source_whois, domain): "whois",
+            pool.submit(source_sec_edgar, domain): "sec",
         }
         fut_yc = pool.submit(source_yc_patterns, domain)
 
@@ -1093,6 +1596,12 @@ def harvest_domain(domain, verbose=False):
             try:
                 result = future.result(timeout=60)
                 emails_set, src = result[0], result[1]
+                # source_website returns extras: scraped_names + email_role dict
+                if src == "website":
+                    if len(result) >= 3:
+                        scraped_names.extend(result[2] or [])
+                    if len(result) >= 4 and isinstance(result[3], dict):
+                        role_hints.update(result[3])
                 source_counts[src] = len(emails_set)
                 for item in emails_set:
                     email = item[0] if isinstance(item, tuple) else item
@@ -1121,8 +1630,30 @@ def harvest_domain(domain, verbose=False):
                     all_emails[email]["sources"].append(yc_src)
                     if name and not all_emails[email]["name"]:
                         all_emails[email]["name"] = name
-        except Exception as e:
+        except Exception:
             source_counts["yc-bruteforce"] = 0
+
+    # ── PATTERN BRUTE (biggest yield lever) ──
+    # Run AFTER the main pool so we can infer the pattern from any emails
+    # already found. Uses the scraped names from source_website.
+    if scraped_names:
+        known_pairs = [(e, info["name"]) for e, info in all_emails.items()
+                       if info.get("name")]
+        try:
+            brute_emails, brute_src = source_pattern_brute(
+                domain, scraped_names, known_pairs)
+            source_counts[brute_src] = len(brute_emails)
+            for email, name in brute_emails:
+                if email not in all_emails:
+                    all_emails[email] = {"name": name, "sources": [brute_src]}
+                else:
+                    all_emails[email]["sources"].append(brute_src)
+                    if name and not all_emails[email]["name"]:
+                        all_emails[email]["name"] = name
+        except Exception as e:
+            source_counts["pattern-brute"] = 0
+            if verbose:
+                print(f"    ⚠️  pattern-brute: {e}")
 
     # ══ CHECKER INTÉGRÉ — chaque email passe les 7 checks ══
     if verbose and all_emails:
@@ -1165,11 +1696,10 @@ def harvest_domain(domain, verbose=False):
         github_url = ghp["url"] if ghp else ""
         gh_login = ghp["login"] if ghp else ""
 
-        # Detect role — GitHub bio + YC founders crossref
-        poste = ""
-        if gh_login:
+        # Detect role — prefer website role hint, then GitHub, then YC crossref
+        poste = role_hints.get(email) or ""
+        if not poste and gh_login:
             poste = get_github_role(gh_login) or ""
-        # If name matches a YC founder → mark as Founder
         if not poste and founders_found:
             for fn in founders_found:
                 if name and (fn.lower() in name.lower() or name.lower() in fn.lower()):

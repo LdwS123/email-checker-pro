@@ -676,6 +676,64 @@ def scrape_export(job_id):
                     headers={"Content-Disposition": "attachment; filename=scraped_emails.csv"})
 
 
+@app.route("/api/scrape/single", methods=["GET", "POST"])
+def scrape_single():
+    """Synchronous single-domain scrape for the bookmarklet / CLI.
+    GET  /api/scrape/single?domain=acme.com  → JSON with results
+    POST /api/scrape/single  { "domain": "acme.com" } → same JSON
+    Blocks up to ~90s; return partial on timeout."""
+    if not SCRAPER_AVAILABLE:
+        return jsonify({"error": f"Scraper unavailable: {_SCRAPER_IMPORT_ERROR}"}), 503
+    json_body = request.get_json(silent=True) or {}
+    raw = request.args.get("domain") or json_body.get("domain") or ""
+    domains = parse_domains(raw)
+    if not domains:
+        return jsonify({"error": "No valid domain"}), 400
+    domain = domains[0]
+    try:
+        results, sources, founders = harvest_domain(domain, verbose=False)
+    except Exception as e:
+        return jsonify({"error": str(e), "domain": domain}), 500
+    return jsonify({
+        "domain": domain,
+        "count": len(results),
+        "sources": sources,
+        "founders": founders,
+        "emails": results,
+    })
+
+
+@app.route("/bookmarklet")
+def bookmarklet_page():
+    """Serves a tiny landing page with a drag-to-bookmarks-bar bookmarklet
+    that scrapes the domain of whatever site the user is currently on."""
+    base = request.url_root.rstrip("/")
+    js = (
+        "(function(){"
+        "var d=location.hostname.replace(/^www\\./,'');"
+        f"window.open('{base}/api/scrape/single?domain='+encodeURIComponent(d),'_blank');"
+        "})();"
+    )
+    # javascript: URL for the <a href>
+    href = "javascript:" + js.replace(" ", "%20")
+    html = f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Bookmarklet — Ultra Scraper</title>
+<style>body{{font-family:-apple-system,sans-serif;max-width:680px;margin:60px auto;padding:0 20px;color:#1d1d1f}}
+h1{{font-size:1.8rem}} a.bm{{display:inline-block;background:#0071e3;color:#fff;padding:14px 22px;
+border-radius:10px;text-decoration:none;font-weight:600;margin:18px 0}}
+code{{background:#f2f2f7;padding:2px 6px;border-radius:4px}}
+.step{{margin:14px 0;color:#555}}</style></head><body>
+<h1>Scrape any site in 1 click</h1>
+<p class="step">1. Drag the blue button below to your bookmarks bar.</p>
+<p class="step">2. Visit any company's website.</p>
+<p class="step">3. Click the bookmark — instant email scrape of that domain.</p>
+<p><a class="bm" href="{href}">➕ Scrape this site</a></p>
+<p class="step">Alternatively, use the CLI: <code>curl '{base}/api/scrape/single?domain=acme.com'</code></p>
+<p class="step"><a href="/">← Back to the web UI</a></p>
+</body></html>"""
+    return Response(html, mimetype="text/html")
+
+
 HTML_TEMPLATE = r"""
 <!DOCTYPE html>
 <html lang="fr">

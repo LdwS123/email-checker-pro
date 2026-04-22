@@ -415,10 +415,10 @@ def verify_single(email):
         result["checks"].append({
             "name": "GitHub Commits",
             "pass": gh > 0,
-            "detail": f"{gh} commits" if gh > 0 else "Aucun commit",
+            "detail": f"{gh} commits" if gh > 0 else "No commits",
         })
     else:
-        result["checks"].append({"name": "GitHub Commits", "pass": None, "detail": "Non verifie (pas de token)"})
+        result["checks"].append({"name": "GitHub Commits", "pass": None, "detail": "Not verified (no token)"})
 
     # 7. GitHub profile
     if ghp:
@@ -473,7 +473,7 @@ def verify_with_timeout(email, timeout=45):
                 "github_commits": None, "blacklist": {},
                 "status": "unknown", "score": 0,
                 "checks": [{"name": "Timeout", "pass": False,
-                             "detail": f"Verification expirée ({timeout}s)"}],
+                             "detail": f"Verification timeout ({timeout}s)"}],
                 "reason": "Timeout",
             }
 
@@ -509,7 +509,7 @@ def check_emails():
     emails = EMAIL_RE.findall(raw)
     emails = list(dict.fromkeys(emails))
     if not emails:
-        return jsonify({"error": "Aucun email valide trouve"}), 400
+        return jsonify({"error": "No valid email found"}), 400
 
     with job_lock:
         job_counter += 1
@@ -556,8 +556,8 @@ def export_csv(job_id):
 
 
 # ═══════════════════════════════════════════════════════════════════
-#   SCRAPER MODULE — greffe sur ultra_scraper.harvest_domain()
-#   Mêmes conventions que /api/check : jobs en mémoire, polling, export CSV
+#   SCRAPER MODULE — wraps ultra_scraper.harvest_domain()
+#   Same conventions as /api/check: in-memory jobs, polling, CSV export
 # ═══════════════════════════════════════════════════════════════════
 
 DOMAIN_RE = re.compile(
@@ -567,7 +567,7 @@ DOMAIN_RE = re.compile(
 
 
 def parse_domains(raw):
-    """Extrait une liste de domaines dédupliquée depuis un texte libre."""
+    """Extract a deduplicated list of domains from free-form text."""
     matches = DOMAIN_RE.findall(raw or "")
     seen = []
     for m in matches:
@@ -578,11 +578,11 @@ def parse_domains(raw):
 
 
 def process_scrape_job(job_id, domains):
-    """Lance harvest_domain sur chaque domaine, accumule les résultats.
+    """Run harvest_domain on each domain, accumulating results.
 
-    Concurrence : séquentielle (1 domaine à la fois). harvest_domain()
-    utilise déjà 9 workers internes pour ses 10 sources OSINT — lancer
-    plusieurs domaines en parallèle risque d'OOM sur Render free (512MB).
+    Concurrency: sequential (1 domain at a time). harvest_domain()
+    already uses internal workers for its OSINT sources — running
+    multiple domains in parallel would risk OOM on Render free (512MB).
     """
     for domain in domains:
         with job_lock:
@@ -611,15 +611,15 @@ def process_scrape_job(job_id, domains):
 def scrape_domains():
     global job_counter
     if not SCRAPER_AVAILABLE:
-        return jsonify({"error": f"Scraper non disponible : {_SCRAPER_IMPORT_ERROR}"}), 503
+        return jsonify({"error": f"Scraper unavailable: {_SCRAPER_IMPORT_ERROR}"}), 503
 
     data = request.json or {}
     raw = data.get("domains", "")
     domains = parse_domains(raw)
     if not domains:
-        return jsonify({"error": "Aucun domaine valide trouvé"}), 400
+        return jsonify({"error": "No valid domain found"}), 400
     if len(domains) > 20:
-        return jsonify({"error": "Max 20 domaines par batch (limite Render free-tier)"}), 400
+        return jsonify({"error": "Max 20 domains per batch (Render free tier limit)"}), 400
 
     with job_lock:
         job_counter += 1
@@ -866,20 +866,20 @@ HTML_TEMPLATE = r"""
     <button class="tab" data-tab="scraper" onclick="switchTab('scraper')">Scraper</button>
   </nav>
 
-  <!-- ═══════ TAB : EMAIL CHECKER ═══════ -->
+  <!-- ═══════ TAB: EMAIL CHECKER ═══════ -->
   <div class="tab-panel active" id="panel-checker">
-    <p class="subtitle">7 verifications par email : Format, DNS/MX, Catch-all, SMTP, Gravatar, GitHub, Blacklist</p>
+    <p class="subtitle">7 checks per email: Format, DNS/MX, Catch-all, SMTP, Gravatar, GitHub, Blacklist</p>
 
-    <textarea id="emailInput" placeholder="Colle tes emails ici, ou importe un CSV...&#10;&#10;john@company.com&#10;jane@startup.io, founder@saas.com&#10;&#10;Tout format accepte : CSV, texte brut, un par ligne..."></textarea>
+    <textarea id="emailInput" placeholder="Paste your emails here, or import a CSV...&#10;&#10;john@company.com&#10;jane@startup.io, founder@saas.com&#10;&#10;Any format accepted: CSV, plain text, one per line..."></textarea>
 
-    <div class="drop-zone" id="dropZone">Glisse un fichier CSV ici</div>
+    <div class="drop-zone" id="dropZone">Drop a CSV file here</div>
 
     <div class="actions">
-      <button class="btn-check" id="btnCheck" onclick="startCheck()">Verifier</button>
+      <button class="btn-check" id="btnCheck" onclick="startCheck()">Check</button>
       <input type="file" id="csvFile" accept=".csv,.txt" onchange="handleCSV(this)">
-      <label class="btn btn-csv" for="csvFile">Importer CSV</label>
-      <button class="btn-clear" id="btnClear" onclick="clearAll()">Effacer</button>
-      <button class="btn-export" id="btnExport" onclick="exportCSV()" disabled>Exporter CSV</button>
+      <label class="btn btn-csv" for="csvFile">Import CSV</label>
+      <button class="btn-clear" id="btnClear" onclick="clearAll()">Clear</button>
+      <button class="btn-export" id="btnExport" onclick="exportCSV()" disabled>Export CSV</button>
       <span class="count-info" id="countInfo"></span>
     </div>
 
@@ -887,25 +887,25 @@ HTML_TEMPLATE = r"""
     <div class="progress-text" id="progressText"></div>
 
     <div class="stats" id="stats">
-      <div class="stat valid"><div class="num" id="nValid">0</div><div class="label">Valides</div></div>
-      <div class="stat invalid"><div class="num" id="nInvalid">0</div><div class="label">Invalides</div></div>
+      <div class="stat valid"><div class="num" id="nValid">0</div><div class="label">Valid</div></div>
+      <div class="stat invalid"><div class="num" id="nInvalid">0</div><div class="label">Invalid</div></div>
       <div class="stat catchall"><div class="num" id="nCatchall">0</div><div class="label">Catch-all</div></div>
-      <div class="stat unknown"><div class="num" id="nUnknown">0</div><div class="label">Inconnus</div></div>
+      <div class="stat unknown"><div class="num" id="nUnknown">0</div><div class="label">Unknown</div></div>
     </div>
 
     <div class="results" id="results"></div>
   </div>
 
-  <!-- ═══════ TAB : SCRAPER ═══════ -->
+  <!-- ═══════ TAB: SCRAPER ═══════ -->
   <div class="tab-panel" id="panel-scraper">
-    <p class="subtitle">Trouve les emails d'un domaine : 10 sources OSINT (GitHub, PGP, Wayback, Bing, site...) + 7 checks de vérification. Max 20 domaines par batch.</p>
+    <p class="subtitle">Find emails for a domain: 12+ OSINT sources (GitHub, PGP, Wayback, Bing, website, crt.sh, HackerNews, packages...) + 7 verification checks. Max 20 domains per batch.</p>
 
-    <textarea id="domainInput" placeholder="Colle des domaines ou URLs, un par ligne...&#10;&#10;acme.com&#10;https://www.startup.io&#10;founder.vc&#10;&#10;Le scraper trouve TOUS les emails personnels + les vérifie."></textarea>
+    <textarea id="domainInput" placeholder="Paste domains or URLs, one per line...&#10;&#10;acme.com&#10;https://www.startup.io&#10;founder.vc&#10;&#10;The scraper finds ALL personal emails + verifies them."></textarea>
 
     <div class="actions">
-      <button class="btn-check" id="btnScrape" onclick="startScrape()">Scraper</button>
-      <button class="btn-clear" id="btnScrapeClear" onclick="clearScrape()">Effacer</button>
-      <button class="btn-export" id="btnScrapeExport" onclick="exportScrapeCSV()" disabled>Exporter CSV</button>
+      <button class="btn-check" id="btnScrape" onclick="startScrape()">Scrape</button>
+      <button class="btn-clear" id="btnScrapeClear" onclick="clearScrape()">Clear</button>
+      <button class="btn-export" id="btnScrapeExport" onclick="exportScrapeCSV()" disabled>Export CSV</button>
       <span class="count-info" id="scrapeCountInfo"></span>
     </div>
 
@@ -914,10 +914,10 @@ HTML_TEMPLATE = r"""
     <div class="scrape-current" id="scrapeCurrent"></div>
 
     <div class="stats" id="scrapeStats">
-      <div class="stat valid"><div class="num" id="sDomains">0</div><div class="label">Domaines</div></div>
-      <div class="stat valid"><div class="num" id="sEmails">0</div><div class="label">Emails vérifiés</div></div>
+      <div class="stat valid"><div class="num" id="sDomains">0</div><div class="label">Domains</div></div>
+      <div class="stat valid"><div class="num" id="sEmails">0</div><div class="label">Verified emails</div></div>
       <div class="stat catchall"><div class="num" id="sHigh">0</div><div class="label">Score ≥ 80</div></div>
-      <div class="stat unknown"><div class="num" id="sErrors">0</div><div class="label">Erreurs</div></div>
+      <div class="stat unknown"><div class="num" id="sErrors">0</div><div class="label">Errors</div></div>
     </div>
 
     <div class="results" id="scrapeResults"></div>
@@ -974,7 +974,7 @@ function startCheck() {
     pollInterval = setInterval(function() { pollStatus(); }, 800);
   })
   .catch(function(err) {
-    alert('Erreur de connexion: ' + err.message);
+    alert('Connection error: ' + err.message);
     resetBtn();
   });
 }
@@ -982,7 +982,7 @@ function startCheck() {
 function resetBtn() {
   isRunning = false;
   document.getElementById('btnCheck').disabled = false;
-  document.getElementById('btnCheck').textContent = 'Verifier';
+  document.getElementById('btnCheck').textContent = 'Check';
 }
 
 function pollStatus() {
@@ -994,7 +994,7 @@ function pollStatus() {
 
       var pct = totalEmails > 0 ? (data.checked / totalEmails * 100).toFixed(0) : 0;
       document.getElementById('progressFill').style.width = pct + '%';
-      document.getElementById('progressText').textContent = data.checked + ' / ' + totalEmails + ' verifie' + (data.checked > 1 ? 's' : '') + ' (' + pct + '%)';
+      document.getElementById('progressText').textContent = data.checked + ' / ' + totalEmails + ' checked (' + pct + '%)';
 
       var container = document.getElementById('results');
       for (var i = lastCount; i < data.results.length; i++) {
@@ -1012,7 +1012,7 @@ function pollStatus() {
         resetBtn();
         document.getElementById('btnExport').disabled = false;
         document.getElementById('progressFill').style.width = '100%';
-        document.getElementById('progressText').textContent = 'Termine ! ' + totalEmails + ' email' + (totalEmails > 1 ? 's' : '') + ' verifie' + (totalEmails > 1 ? 's' : '');
+        document.getElementById('progressText').textContent = 'Done! ' + totalEmails + ' email' + (totalEmails > 1 ? 's' : '') + ' checked';
       }
     })
     .catch(function() {});
@@ -1027,7 +1027,7 @@ function renderCard(r) {
 
   var badge = document.createElement('span');
   badge.className = 'badge ' + r.status;
-  var labels = {valid: 'VALIDE', 'catch-all': 'CATCH-ALL', invalid: 'INVALIDE', unknown: 'INCONNU'};
+  var labels = {valid: 'VALID', 'catch-all': 'CATCH-ALL', invalid: 'INVALID', unknown: 'UNKNOWN'};
   badge.textContent = labels[r.status] || r.status.toUpperCase();
 
   var email = document.createElement('span');
@@ -1106,7 +1106,7 @@ function handleCSV(input) {
     var text = e.target.result;
     var emails = text.match(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g);
     if (!emails || emails.length === 0) {
-      alert('Aucun email trouve dans le fichier');
+      alert('No email found in file');
       return;
     }
     var unique = emails.filter(function(v, i, a) { return a.indexOf(v) === i; });
@@ -1124,7 +1124,7 @@ function handleCSV(input) {
 
 function clearAll() {
   if (isRunning) {
-    if (!confirm('Verification en cours. Effacer quand meme ?')) return;
+    if (!confirm('Check in progress. Clear anyway?')) return;
     if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
     resetBtn();
   }
@@ -1162,7 +1162,7 @@ dropZone.addEventListener('drop', function(e) {
   var reader = new FileReader();
   reader.onload = function(ev) {
     var emails = ev.target.result.match(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g);
-    if (!emails || emails.length === 0) { alert('Aucun email dans le fichier'); return; }
+    if (!emails || emails.length === 0) { alert('No email in file'); return; }
     var unique = emails.filter(function(v, i, a) { return a.indexOf(v) === i; });
     ta.value = ta.value.trim() ? ta.value.trim() + '\n' + unique.join('\n') : unique.join('\n');
     countEmails();
@@ -1173,8 +1173,8 @@ document.addEventListener('dragover', function(e) { e.preventDefault(); });
 document.addEventListener('drop', function(e) { e.preventDefault(); });
 
 // ═══════════════════════════════════════════════════════════════════
-//   SCRAPER TAB — état + polling isolés du Checker
-//   Rendu 100% via DOM APIs (createElement / textContent) pour éviter XSS
+//   SCRAPER TAB — state + polling isolated from Checker
+//   Rendering 100% via DOM APIs (createElement / textContent) to prevent XSS
 // ═══════════════════════════════════════════════════════════════════
 var scrapeJobId = null;
 var scrapePoll = null;
@@ -1200,7 +1200,7 @@ function countDomains() {
     if (d) seen.add(d);
   });
   var n = seen.size;
-  document.getElementById('scrapeCountInfo').textContent = n ? n + ' domaine' + (n > 1 ? 's' : '') + ' détecté' + (n > 1 ? 's' : '') : '';
+  document.getElementById('scrapeCountInfo').textContent = n ? n + ' domain' + (n > 1 ? 's' : '') + ' detected' : '';
   return n;
 }
 
@@ -1221,7 +1221,7 @@ function startScrape() {
   document.getElementById('scrapeProgressText').style.display = 'block';
   document.getElementById('scrapeStats').style.display = 'flex';
   document.getElementById('scrapeProgressFill').style.width = '0%';
-  document.getElementById('scrapeProgressText').textContent = 'Démarrage...';
+  document.getElementById('scrapeProgressText').textContent = 'Starting...';
   document.getElementById('scrapeCurrent').style.display = 'none';
   scrapeLastResultCount = 0;
   scrapeLastChecked = 0;
@@ -1237,15 +1237,15 @@ function startScrape() {
     if (data.error) { alert(data.error); resetScrapeBtn(); return; }
     scrapeJobId = data.job_id;
     scrapeTotal = data.total;
-    document.getElementById('scrapeCountInfo').textContent = data.total + ' domaine' + (data.total > 1 ? 's' : '');
+    document.getElementById('scrapeCountInfo').textContent = data.total + ' domain' + (data.total > 1 ? 's' : '');
     scrapePoll = setInterval(pollScrapeStatus, 1500);
   })
-  .catch(function(err) { alert('Erreur réseau: ' + err.message); resetScrapeBtn(); });
+  .catch(function(err) { alert('Network error: ' + err.message); resetScrapeBtn(); });
 }
 
 function resetScrapeBtn() {
   document.getElementById('btnScrape').disabled = false;
-  document.getElementById('btnScrape').textContent = 'Scraper';
+  document.getElementById('btnScrape').textContent = 'Scrape';
 }
 
 function pollScrapeStatus() {
@@ -1258,12 +1258,12 @@ function pollScrapeStatus() {
       var pct = scrapeTotal > 0 ? (data.checked / scrapeTotal * 100).toFixed(0) : 0;
       document.getElementById('scrapeProgressFill').style.width = pct + '%';
       document.getElementById('scrapeProgressText').textContent =
-        data.checked + ' / ' + scrapeTotal + ' domaine' + (scrapeTotal > 1 ? 's' : '') + ' (' + pct + '%) — ' + data.results.length + ' emails trouvés';
+        data.checked + ' / ' + scrapeTotal + ' domain' + (scrapeTotal > 1 ? 's' : '') + ' (' + pct + '%) — ' + data.results.length + ' emails found';
 
       if (data.current) {
         var el = document.getElementById('scrapeCurrent');
         el.style.display = 'block';
-        el.textContent = '🔍 En cours : ' + data.current;
+        el.textContent = '🔍 In progress: ' + data.current;
       } else {
         document.getElementById('scrapeCurrent').style.display = 'none';
       }
@@ -1283,7 +1283,7 @@ function pollScrapeStatus() {
         document.getElementById('btnScrapeExport').disabled = data.results.length === 0;
         document.getElementById('scrapeProgressFill').style.width = '100%';
         document.getElementById('scrapeProgressText').textContent =
-          'Terminé ! ' + data.results.length + ' email' + (data.results.length > 1 ? 's' : '') + ' vérifié' + (data.results.length > 1 ? 's' : '') + ' sur ' + scrapeTotal + ' domaine' + (scrapeTotal > 1 ? 's' : '');
+          'Done! ' + data.results.length + ' verified email' + (data.results.length > 1 ? 's' : '') + ' across ' + scrapeTotal + ' domain' + (scrapeTotal > 1 ? 's' : '');
         document.getElementById('scrapeCurrent').style.display = 'none';
       }
     })

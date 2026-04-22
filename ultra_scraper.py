@@ -41,7 +41,7 @@ GH_TOKEN = os.environ.get("GH_TOKEN", "")
 
 OUTPUT = "ultra_results.csv"
 DONE_FILE = "ultra_done.txt"
-WORKERS_SOURCES = 8
+WORKERS_SOURCES = 10
 MAX_GH_REPOS = 8
 MAX_GH_COMMITS = 40
 
@@ -950,10 +950,121 @@ def source_theharvester(domain):
 
 
 # ══════════════════════════════════════════════════════════════
-# MAIN HARVESTER — 10 sources en parallèle
+# SOURCE 11: Certificate Transparency (crt.sh) — subdomain enum
+# ══════════════════════════════════════════════════════════════
+def source_crtsh(domain):
+    """Enumerate subdomains via crt.sh (Certificate Transparency logs),
+    then scrape the top N subdomains for personal emails of the root
+    domain. Free, no auth, covers api/careers/staff/etc. subs."""
+    emails = set()
+    try:
+        r = SESSION.get(
+            "https://crt.sh/",
+            params={"q": f"%.{domain}", "output": "json"},
+            timeout=20,
+        )
+        if r.status_code != 200:
+            return emails, "crtsh"
+        # crt.sh occasionally returns HTML when overloaded — guard.
+        try:
+            data = r.json()
+        except Exception:
+            return emails, "crtsh"
+    except Exception:
+        return emails, "crtsh"
+
+    subs = set()
+    for entry in data or []:
+        name = (entry.get("name_value") or "").lower()
+        for line in name.split("\n"):
+            line = line.strip().lstrip("*.")
+            if line.endswith(f".{domain}") and line != domain:
+                # Skip deep wildcards (foo.bar.baz.domain) — mostly noise
+                if line.count(".") <= domain.count(".") + 2:
+                    subs.add(line)
+
+    # Cap to keep latency bounded (crt.sh can return hundreds)
+    TOP_N = 8
+    priority_prefixes = ("www", "blog", "about", "team", "careers", "jobs",
+                         "staff", "people", "press", "contact", "hello")
+    ranked = sorted(subs, key=lambda s: (
+        0 if s.split(".")[0] in priority_prefixes else 1,
+        len(s),
+    ))[:TOP_N]
+
+    for sub in ranked:
+        for scheme in ("https", "http"):
+            try:
+                rr = SESSION.get(f"{scheme}://{sub}", timeout=6,
+                                 allow_redirects=True)
+                if rr.status_code == 200:
+                    for e in extract_emails(rr.text, domain):
+                        emails.add((e, ""))
+                    break
+            except Exception:
+                continue
+
+    return emails, "crtsh"
+
+
+# ══════════════════════════════════════════════════════════════
+# SOURCE 12: HackerNews — bios + posts via Algolia HN API
+# ══════════════════════════════════════════════════════════════
+def source_hackernews(domain):
+    """Search HackerNews for mentions of the domain, collect authors,
+    then fetch each author's HN profile — `about` fields frequently
+    contain personal emails ("contact me: x@y.com"). Free, no auth."""
+    emails = set()
+    authors = set()
+
+    # Step 1 — search stories/comments referencing the domain
+    try:
+        r = SESSION.get(
+            "https://hn.algolia.com/api/v1/search",
+            params={"query": domain, "hitsPerPage": 50,
+                    "tags": "(story,comment)"},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return emails, "hackernews"
+        for hit in r.json().get("hits", []) or []:
+            author = hit.get("author")
+            if author:
+                authors.add(author)
+            # Opportunistically scan story_text / comment_text
+            for field in ("story_text", "comment_text", "url"):
+                text = hit.get(field) or ""
+                for e in extract_emails(text, domain):
+                    emails.add((e, author or ""))
+    except Exception:
+        return emails, "hackernews"
+
+    # Step 2 — fetch each author's profile, scrape the bio
+    AUTHOR_CAP = 20
+    for author in list(authors)[:AUTHOR_CAP]:
+        try:
+            rr = SESSION.get(
+                f"https://hn.algolia.com/api/v1/users/{author}",
+                timeout=6,
+            )
+            if rr.status_code != 200:
+                continue
+            about = (rr.json() or {}).get("about") or ""
+            if not about:
+                continue
+            for e in extract_emails(about, domain):
+                emails.add((e, author))
+        except Exception:
+            continue
+
+    return emails, "hackernews"
+
+
+# ══════════════════════════════════════════════════════════════
+# MAIN HARVESTER — 12 sources en parallèle
 # ══════════════════════════════════════════════════════════════
 def harvest_domain(domain, verbose=False):
-    """Run les 10 sources en parallèle, vérifie via checker."""
+    """Run les 12 sources en parallèle, vérifie via checker."""
     all_emails = {}  # email -> {name, sources}
     founders_found = []
     source_counts = {}
@@ -972,6 +1083,8 @@ def harvest_domain(domain, verbose=False):
             pool.submit(source_pgp, domain): "pgp",
             pool.submit(source_packages, domain): "packages",
             pool.submit(source_theharvester, domain): "harvester",
+            pool.submit(source_crtsh, domain): "crtsh",
+            pool.submit(source_hackernews, domain): "hackernews",
         }
         fut_yc = pool.submit(source_yc_patterns, domain)
 
